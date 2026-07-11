@@ -1,0 +1,12 @@
+# The image build only needs go.mod/go.sum + Go source. Keep VCS, CI config,
+# docs, and local build artifacts out of the build context (smaller, faster,
+# and nothing extraneous reaches the builder).
+.git
+.gitignore
+.dockerignore
+.woodpecker
+*.md
+LICENSE
+THREAT-MODEL.md
+/sigil
+/cmd/server/server
