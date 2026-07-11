@@ -49,8 +49,13 @@ const (
 	// maxImageDimension / maxImagePixels bound a decoded image's declared size
 	// before any pixels are allocated, defeating decompression bombs: a sub-100
 	// KB PNG/GIF can declare billions of pixels and OOM the process
-	// (golang/go#5050). 1024x1024 is generous for a favicon.
-	maxImageDimension = 1024
+	// (golang/go#5050). 2048x2048 comfortably admits real high-resolution source
+	// icons (e.g. ciphera.net ships a 1207x1272 PNG; PWA/apple-touch icons are
+	// often 512-1024+) while still rejecting the bomb class by many orders of
+	// magnitude. A 2048x2048 RGBA decode is ~16 MB, so the resolver caps how many
+	// candidates decode at once (see maxConcurrentCandidates) and the service
+	// runs with a matching memory reservation + GOMEMLIMIT.
+	maxImageDimension = 2048
 	maxImagePixels    = maxImageDimension * maxImageDimension
 
 	// Layered timeouts — any single one is insufficient on its own. The caller's
@@ -63,7 +68,13 @@ const (
 	// sniffLen is how many leading bytes http.DetectContentType inspects.
 	sniffLen = 512
 
-	userAgent = "Sigil/1.0 (+https://github.com/ciphera-net/sigil)"
+	// userAgent presents as a mainstream browser. A bot/identifying UA is
+	// refused by a non-trivial number of sites' WAFs even for a public favicon,
+	// which needlessly loses coverage; Sigil is doing exactly what a browser does
+	// when it fetches a page's icon. (This does not defeat IP-reputation blocks —
+	// those are inherent to fetching from a datacenter rather than via a
+	// whitelisted crawler.)
+	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 // Fetch-boundary errors. They are sentinels so callers (and the test suite) can

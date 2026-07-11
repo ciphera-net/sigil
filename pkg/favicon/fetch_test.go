@@ -388,7 +388,9 @@ func TestAllowedTypesExcludeMarkup(t *testing.T) {
 			t.Fatalf("%q must not be an accepted content type", forbidden)
 		}
 	}
-	if !strings.HasPrefix(userAgent, "Sigil/") {
-		t.Fatalf("unexpected user agent %q", userAgent)
+	// Deliberately presents as a browser (not a bot UA) to avoid WAF blocks on
+	// public favicons; see the userAgent const.
+	if !strings.HasPrefix(userAgent, "Mozilla/") {
+		t.Fatalf("expected a browser user agent, got %q", userAgent)
 	}
 }

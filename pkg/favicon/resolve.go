@@ -25,6 +25,12 @@ var ErrInvalidDomain = errors.New("favicon: invalid domain")
 // thousands of outbound requests.
 const maxCandidates = 12
 
+// maxConcurrentCandidates bounds how many candidates decode at once within a
+// single resolve. A candidate can be up to 2048x2048 (~16 MB decoded), so this
+// caps a resolve's peak decode memory (~6 x 16 MB) regardless of how many
+// candidates a hostile page lists.
+const maxConcurrentCandidates = 6
+
 // wellKnownPaths are probed unconditionally: these are frequently present with
 // no <link> declaring them. (SVG well-known paths are intentionally omitted.)
 var wellKnownPaths = []string{
@@ -124,7 +130,11 @@ func (r *Resolver) resolveUncached(ctx context.Context, domain string, sz int) (
 		}
 	}
 
-	// 3. Fetch and decode candidates concurrently (each independently guarded).
+	// 3. Fetch and decode candidates concurrently (each independently guarded),
+	//    but bound how many decode at once: a large candidate (up to 2048x2048)
+	//    is ~16 MB decoded, and a hostile page could list many, so the semaphore
+	//    keeps a single resolve's peak decode memory bounded.
+	sem := make(chan struct{}, maxConcurrentCandidates)
 	var (
 		mu    sync.Mutex
 		cands []candidate
@@ -134,6 +144,8 @@ func (r *Resolver) resolveUncached(ctx context.Context, domain string, sz int) (
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			res, err := r.fetcher.Fetch(ctx, u)
 			if err != nil {
 				return

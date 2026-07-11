@@ -95,11 +95,14 @@ func TestBoundDims(t *testing.T) {
 	}{
 		{32, 32, true},
 		{1024, 1024, true},
-		{1025, 16, false},
-		{16, 1025, false},
+		{1207, 1272, true}, // ciphera.net's real favicon — must be admitted
+		{2048, 2048, true}, // exactly at the cap
+		{2049, 16, false},  // over the dimension cap
+		{16, 2049, false},
 		{0, 16, false},
 		{-1, 16, false},
-		{2048, 2048, false},
+		{4096, 4096, false}, // well over
+		{100000, 100000, false},
 	}
 	for _, tc := range cases {
 		err := boundDims(tc.w, tc.h)
