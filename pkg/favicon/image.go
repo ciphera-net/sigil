@@ -2,6 +2,7 @@ package favicon
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"image"
@@ -92,8 +93,9 @@ func declaredEntryDimensions(entry []byte) (int64, int64) {
 // decodeImage decodes validated icon bytes of the given sniffed type. ICO is
 // routed through besticon explicitly, and only after its selected entry's real
 // dimensions are bounded; other types go through the stdlib/x-image decoders.
-// The decoded result is re-bounded as defense in depth.
-func decodeImage(sniffed string, data []byte) (image.Image, error) {
+// SVG is guarded again (bytes/tokens/depth) and rasterized under a wall-clock
+// budget derived from ctx. The decoded result is re-bounded as defense in depth.
+func decodeImage(ctx context.Context, sniffed string, data []byte) (image.Image, error) {
 	var (
 		img image.Image
 		err error
@@ -104,6 +106,11 @@ func decodeImage(sniffed string, data []byte) (image.Image, error) {
 			return nil, derr
 		}
 		img, err = ico.Decode(bytes.NewReader(data))
+	case svgContentType:
+		if derr := guardSVG(data); derr != nil {
+			return nil, derr
+		}
+		img, err = rasterizeWithBudget(ctx, data)
 	default:
 		img, _, err = image.Decode(bytes.NewReader(data))
 	}
@@ -118,9 +125,9 @@ func decodeImage(sniffed string, data []byte) (image.Image, error) {
 }
 
 // decodeCandidate decodes icon bytes into a candidate with its representative
-// size.
-func decodeCandidate(sniffed string, data []byte) (candidate, error) {
-	img, err := decodeImage(sniffed, data)
+// size. ctx bounds the SVG rasterization path; non-SVG decoders ignore it.
+func decodeCandidate(ctx context.Context, sniffed string, data []byte) (candidate, error) {
+	img, err := decodeImage(ctx, sniffed, data)
 	if err != nil {
 		return candidate{}, err
 	}

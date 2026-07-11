@@ -2,6 +2,7 @@ package favicon
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"image"
@@ -54,7 +55,7 @@ func buildICOWithPNG(t *testing.T, dirW, dirH byte, payload []byte) []byte {
 // --- decode / bound ----------------------------------------------------------
 
 func TestDecodeCandidatePNG(t *testing.T) {
-	c, err := decodeCandidate("image/png", realPNG(t, 64, 48))
+	c, err := decodeCandidate(context.Background(), "image/png", realPNG(t, 64, 48))
 	if err != nil {
 		t.Fatalf("decodeCandidate PNG: %v", err)
 	}
@@ -65,7 +66,7 @@ func TestDecodeCandidatePNG(t *testing.T) {
 
 func TestDecodeCandidateICO(t *testing.T) {
 	ico := buildICOWithPNG(t, 32, 32, realPNG(t, 32, 32))
-	c, err := decodeCandidate("image/x-icon", ico)
+	c, err := decodeCandidate(context.Background(), "image/x-icon", ico)
 	if err != nil {
 		t.Fatalf("decodeCandidate ICO: %v", err)
 	}
@@ -83,7 +84,7 @@ func TestDecodeICOBombRejected(t *testing.T) {
 	if _, _, err := icoBestEntryDims(bomb); !errors.Is(err, ErrImageTooLarge) {
 		t.Fatalf("icoBestEntryDims: want ErrImageTooLarge, got %v", err)
 	}
-	if _, err := decodeCandidate("image/x-icon", bomb); !errors.Is(err, ErrImageTooLarge) {
+	if _, err := decodeCandidate(context.Background(), "image/x-icon", bomb); !errors.Is(err, ErrImageTooLarge) {
 		t.Fatalf("decodeCandidate: want ErrImageTooLarge, got %v", err)
 	}
 }
@@ -149,7 +150,7 @@ func TestSelectBest(t *testing.T) {
 // --- render ------------------------------------------------------------------
 
 func TestRenderPNGProducesRequestedSize(t *testing.T) {
-	src, err := decodeCandidate("image/png", realPNG(t, 64, 64))
+	src, err := decodeCandidate(context.Background(), "image/png", realPNG(t, 64, 64))
 	if err != nil {
 		t.Fatal(err)
 	}

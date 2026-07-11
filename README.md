@@ -40,9 +40,16 @@ The fetch boundary (`pkg/favicon/fetch.go`) enforces, for every request and
   content type is decided by **sniffing** (never the response header), only
   raster image types are accepted, and the decoded pixel dimensions are
   bounded *before* full decode to defeat decompression bombs.
-- **No SVG.** SVG favicons are rejected in v1: an SVG is XML that can carry
-  script (stored-XSS risk) or external entities (XXE / second-order SSRF). The
-  monogram fallback covers the small number of SVG-only sites.
+- **SVG only through a sandboxed rasterizer.** An SVG is XML that can carry
+  script (stored-XSS risk) or external entities (XXE / second-order SSRF), so
+  SVG bytes are never served or stored: a structurally-detected SVG is bounded
+  (bytes, XML tokens, nesting depth) and rendered to a fixed-size pixel buffer
+  by a pure-Go renderer ([`oksvg`](https://github.com/srwiley/oksvg) +
+  [`rasterx`](https://github.com/srwiley/rasterx)) built on `encoding/xml`,
+  which has no code path that loads external entities, DTDs, or URLs — the
+  XXE class cannot be expressed, and a no-network regression test keeps it
+  that way. Renderer panics are contained per candidate. The output, like
+  every icon Sigil serves, is a freshly encoded PNG.
 
 The SSRF test suite (`pkg/favicon/fetch_test.go`) asserts each of these
 independently of the guard library, so a dependency bump that regressed a range

@@ -102,10 +102,11 @@ var (
 	ErrUpstreamStatus = errors.New("favicon: non-200 upstream status")
 )
 
-// allowedSniffedTypes is the set of content types (as produced by
-// http.DetectContentType) we will accept. Anything else — text/html, text/xml,
-// image/svg+xml, image/bmp, application/*, ... — is rejected. Note that
-// DetectContentType reports ICO as "image/x-icon".
+// allowedSniffedTypes is the set of content types we will accept after
+// sniffing (and, for SVG, positive structural detection — see Fetch). Anything
+// else — text/html, plain text/xml, image/bmp, application/*, ... — is
+// rejected. Note that DetectContentType reports ICO as "image/x-icon" and has
+// no SVG signature at all: svgContentType only ever enters via looksLikeSVG.
 var allowedSniffedTypes = map[string]struct{}{
 	"image/png":                {},
 	"image/x-icon":             {},
@@ -113,6 +114,7 @@ var allowedSniffedTypes = map[string]struct{}{
 	"image/gif":                {},
 	"image/jpeg":               {},
 	"image/webp":               {},
+	svgContentType:             {},
 }
 
 // FetchResult is a validated favicon candidate. Body holds the original,
@@ -257,8 +259,15 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*FetchResult, error
 	}
 
 	// Content type by sniffing the bytes, never the response header (a hostile
-	// server can label an HTML page or an SVG as image/png).
+	// server can label an HTML page or an SVG as image/png). SVG has no sniff
+	// signature — it surfaces as text/xml or text/plain — so those two types
+	// get one structural check: if the root element is <svg>, the candidate is
+	// classified as SVG and takes the guarded rasterization path; otherwise
+	// they stay rejected like any other text.
 	sniffed := sniffType(body)
+	if svgSniffCandidate(sniffed) && looksLikeSVG(body) {
+		sniffed = svgContentType
+	}
 	if _, ok := allowedSniffedTypes[sniffed]; !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, sniffed)
 	}
@@ -322,6 +331,11 @@ func guardImageSize(sniffed string, body []byte) error {
 	if sniffed == "image/x-icon" || sniffed == "image/vnd.microsoft.icon" {
 		_, _, err := icoBestEntryDims(body)
 		return err
+	}
+	// SVG carries no raster header; its pre-decode bound is structural (bytes,
+	// tokens, depth) and its pixel allocation is fixed by rasterizeSVG.
+	if sniffed == svgContentType {
+		return guardSVG(body)
 	}
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(body))
 	if err != nil {

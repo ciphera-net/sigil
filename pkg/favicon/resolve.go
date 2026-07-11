@@ -32,7 +32,10 @@ const maxCandidates = 12
 const maxConcurrentCandidates = 6
 
 // wellKnownPaths are probed unconditionally: these are frequently present with
-// no <link> declaring them. (SVG well-known paths are intentionally omitted.)
+// no <link> declaring them. (No SVG well-known path is probed: sites shipping
+// an SVG favicon declare it via <link>, which is where the resolver finds it;
+// probing /favicon.svg would add a request to every resolve for near-zero
+// yield.)
 var wellKnownPaths = []string{
 	"/favicon.ico",
 	"/apple-touch-icon.png",
@@ -150,7 +153,7 @@ func (r *Resolver) resolveUncached(ctx context.Context, domain string, sz int) (
 			if err != nil {
 				return
 			}
-			c, err := decodeCandidate(res.ContentType, res.Body)
+			c, err := decodeCandidate(ctx, res.ContentType, res.Body)
 			if err != nil {
 				return
 			}
@@ -168,7 +171,7 @@ func (r *Resolver) resolveUncached(ctx context.Context, domain string, sz int) (
 	return renderPNG(best.img, sz)
 }
 
-// parseIconLinks extracts absolute, http(s), non-SVG icon URLs declared by
+// parseIconLinks extracts absolute http(s) icon URLs declared by
 // <link rel="icon|shortcut icon|apple-touch-icon|apple-touch-icon-precomposed">
 // in an HTML document, resolving relative hrefs against <base href> if present,
 // else against baseURL.
@@ -225,13 +228,12 @@ func isIconRel(rel string) bool {
 	return false
 }
 
-// isFetchableIcon accepts only http/https URLs that are not SVG. SVG is rejected
-// at discovery (as well as at the fetch boundary) per the v1 no-SVG policy.
+// isFetchableIcon accepts only http/https URLs. SVG candidates are fetched
+// like any other since phase 5 — the fetch boundary classifies them
+// structurally and routes them through the guarded rasterizer (svg.go), so a
+// path suffix no longer decides anything.
 func isFetchableIcon(u *url.URL) bool {
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return false
-	}
-	return !strings.HasSuffix(strings.ToLower(u.Path), ".svg")
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 func nodeAttr(n *html.Node, key string) string {

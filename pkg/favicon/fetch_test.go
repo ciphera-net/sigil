@@ -251,16 +251,37 @@ func TestFetchRejectsHTMLLabelledAsImage(t *testing.T) {
 	}
 }
 
-func TestFetchRejectsSVG(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "image/svg+xml")
-		w.Write([]byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>evil()</script></svg>`))
-	}))
-	defer srv.Close()
+// TestFetchClassifiesHostileSVG: since phase 5, SVG is accepted — but only ever
+// as svgContentType headed for the guarded rasterizer, never as passthrough
+// bytes (the XSS payload below dies at re-encode: the served result is PNG
+// pixels). Non-SVG XML remains rejected outright.
+func TestFetchClassifiesHostileSVG(t *testing.T) {
+	t.Run("script svg classified for rasterization", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "image/svg+xml")
+			w.Write([]byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" onload="alert(1)"><script>evil()</script></svg>`))
+		}))
+		defer srv.Close()
 
-	if _, err := newTestFetcher().Fetch(context.Background(), srv.URL); !errors.Is(err, ErrUnsupportedType) {
-		t.Fatalf("want ErrUnsupportedType for SVG, got %v", err)
-	}
+		res, err := newTestFetcher().Fetch(context.Background(), srv.URL)
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		if res.ContentType != svgContentType {
+			t.Fatalf("ContentType = %q, want %q", res.ContentType, svgContentType)
+		}
+	})
+	t.Run("non-svg xml still rejected", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "image/svg+xml")
+			w.Write([]byte(`<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>x</title></feed>`))
+		}))
+		defer srv.Close()
+
+		if _, err := newTestFetcher().Fetch(context.Background(), srv.URL); !errors.Is(err, ErrUnsupportedType) {
+			t.Fatalf("want ErrUnsupportedType for non-SVG XML, got %v", err)
+		}
+	})
 }
 
 // TestFetchRejectsSVGWithPNGMagic covers the disguise: an SVG payload prefixed
@@ -381,12 +402,19 @@ func pngWithDimensions(t *testing.T, w, h uint32) []byte {
 	return buf.Bytes()
 }
 
-// Guard against an accidental relaxation of the accepted-type set.
+// Guard against an accidental relaxation of the accepted-type set. Text and
+// markup types must never be directly accepted; svgContentType's presence is
+// deliberate and safe because http.DetectContentType has no SVG signature, so
+// bytes only ever carry that type after looksLikeSVG vouched for their
+// structure.
 func TestAllowedTypesExcludeMarkup(t *testing.T) {
-	for _, forbidden := range []string{"text/html", "text/xml", "image/svg+xml", "text/plain", "application/xml"} {
+	for _, forbidden := range []string{"text/html", "text/xml", "text/plain", "application/xml"} {
 		if _, ok := allowedSniffedTypes[forbidden]; ok {
 			t.Fatalf("%q must not be an accepted content type", forbidden)
 		}
+	}
+	if _, ok := allowedSniffedTypes[svgContentType]; !ok {
+		t.Fatalf("%q must be accepted (guarded rasterization path)", svgContentType)
 	}
 	// Deliberately presents as a browser (not a bot UA) to avoid WAF blocks on
 	// public favicons; see the userAgent const.

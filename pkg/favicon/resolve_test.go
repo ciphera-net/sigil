@@ -128,9 +128,12 @@ func TestResolveNegativeAndCached(t *testing.T) {
 	}
 }
 
-// TestResolveSkipsSVGCandidate: an SVG link is declared first, a PNG second.
-// The SVG must never be fetched; resolution comes from the PNG.
-func TestResolveSkipsSVGCandidate(t *testing.T) {
+// TestResolveFetchesSVGCandidate: since phase 5 an SVG link is a real
+// candidate, so it IS fetched — and when it turns out to be undrawable (this
+// fixture has no viewBox and no content), it is rejected per-candidate and
+// resolution still succeeds from the PNG. One bad SVG must never sink a
+// resolve.
+func TestResolveFetchesSVGCandidate(t *testing.T) {
 	var svgFetched int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -156,8 +159,8 @@ func TestResolveSkipsSVGCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if atomic.LoadInt32(&svgFetched) != 0 {
-		t.Fatal("the SVG candidate was fetched; it must be filtered at discovery")
+	if got := atomic.LoadInt32(&svgFetched); got != 1 {
+		t.Fatalf("the SVG candidate must be fetched exactly once, got %d", got)
 	}
 	if w, h := mustDecodePNG(t, out); w != 32 || h != 32 {
 		t.Fatalf("resolved %dx%d, want 32x32", w, h)
@@ -183,6 +186,7 @@ func TestParseIconLinks(t *testing.T) {
 	want := []string{
 		"https://cdn.example.com/assets/favicon.png", // relative, resolved against <base>
 		"https://cdn.example.com/legacy.ico",         // root-relative against base host
+		"https://cdn.example.com/vector.svg",         // SVG is a first-class candidate since phase 5
 		"https://other.example.com/at.png",           // absolute
 	}
 	sort.Strings(want)
