@@ -67,7 +67,7 @@ Requires **Go 1.25+**.
 
 | Route | Response |
 |-------|----------|
-| `GET /icon?domain=<hostname>&sz=<16\|32\|64\|128>` | `200 image/png` resolved icon · `404` no icon (negatively cached) · `400` bad domain/size |
+| `GET /icon?domain=<hostname>&sz=<16\|32\|64\|128>` | `200 image/png` resolved icon · `404` no icon (negatively cached) · `400` bad domain/size · `502` upstream fetch failure (not cached) |
 | `GET /healthz` | liveness |
 | `GET /metrics` | Prometheus |
 
