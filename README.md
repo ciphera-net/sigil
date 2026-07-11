@@ -1,4 +1,4 @@
-# sigil
+# Sigil
 
 A small, self-hosted favicon resolver. Given a domain, Sigil fetches that
 site's real favicon **server-side**, normalizes it to a PNG at the size you
