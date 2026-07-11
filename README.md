@@ -6,11 +6,10 @@ ask for, and caches the result. It exists to replace third-party favicon
 proxies (e.g. `google.com/s2/favicons`) so that resolving an icon never leaks
 which domains your users look up to an outside party.
 
-> Self-reviewed; not yet independently audited. Apache-2.0. Sigil dereferences
-> URLs derived from untrusted, caller-supplied domains — it is an SSRF surface
-> by design. Read the [Security model](#security-model) and
-> [`THREAT-MODEL.md`](./THREAT-MODEL.md) before deploying it anywhere it can
-> reach a network you care about.
+> Apache-2.0. Sigil fetches URLs derived from untrusted domains — an SSRF
+> surface by design — so a hardened fetch boundary is its headline feature (see
+> the [Security model](#security-model) and [`THREAT-MODEL.md`](./THREAT-MODEL.md)).
+> Self-reviewed, not independently audited.
 
 ## Security model
 
