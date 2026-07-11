@@ -1,0 +1,11 @@
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+
+steps:
+  govulncheck:
+    image: golang:1.25
+    commands:
+      - go install golang.org/x/vuln/cmd/govulncheck@latest
+      - govulncheck ./...

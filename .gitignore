@@ -1,0 +1,12 @@
+*.test
+*.out
+/coverage*
+
+# Local build artifacts
+/sigil
+/cmd/server/server
+
+# Never commit secrets or environment overrides (Sigil has none in prod,
+# but keep local experiments out of the tree).
+.env
+.env.*

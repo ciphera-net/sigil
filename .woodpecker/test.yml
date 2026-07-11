@@ -1,0 +1,12 @@
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+
+steps:
+  unit:
+    image: golang:1.25
+    commands:
+      - test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - go vet ./...
+      - go test -race ./...
