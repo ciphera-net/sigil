@@ -1,0 +1,23 @@
+depends_on:
+  - build
+
+when:
+  - event: push
+    branch: main
+
+steps:
+  push:
+    image: woodpeckerci/plugin-docker-buildx:6.1.1
+    settings:
+      registry: registry.ops.ciphera.net
+      repo: registry.ops.ciphera.net/ciphera-net/sigil
+      tags:
+        - sha-${CI_COMMIT_SHA:0:7}
+        - latest
+      username:
+        from_secret: registry_username
+      password:
+        from_secret: registry_password
+      cache_from:
+        - type=registry\,ref=registry.ops.ciphera.net/ciphera-net/sigil:buildcache
+      cache_to: type=registry,ref=registry.ops.ciphera.net/ciphera-net/sigil:buildcache,mode=max

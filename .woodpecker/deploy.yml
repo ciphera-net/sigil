@@ -1,0 +1,40 @@
+depends_on:
+  - push
+
+when:
+  - event: push
+    branch: main
+
+steps:
+  deploy:
+    image: alpine:3.20
+    volumes:
+      - /opt/woodpecker/secrets/nomad-token:/run/ci/nomad-token:ro
+      - /opt/vault-agent/tls/ca.pem:/run/ci/nomad-ca.pem:ro
+    environment:
+      REGISTRY_USERNAME:
+        from_secret: registry_username
+      REGISTRY_PASSWORD:
+        from_secret: registry_password
+    commands:
+      - apk add --no-cache curl jq >/dev/null
+      - export NOMAD_TOKEN=$(cat /run/ci/nomad-token)
+      - export DEPLOY_SHA=${CI_COMMIT_SHA:0:7}
+      - |
+        DIGEST=$(curl -sfI -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+          -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+          "https://registry.ops.ciphera.net/v2/ciphera-net/sigil/manifests/sha-$DEPLOY_SHA" \
+          | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}')
+        test -n "$DIGEST"
+      - |
+        curl -sf --cacert /run/ci/nomad-ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
+          https://10.10.0.110:4646/v1/job/sigil | jq \
+          ".Meta.deploy_sha = \"$DEPLOY_SHA\" |
+           .TaskGroups[0].Tasks[0].Config.image = \"registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST\" |
+           .TaskGroups[0].Tasks[0].Config.force_pull = true" > /tmp/job.json
+      - |
+        curl -fsS --cacert /run/ci/nomad-ca.pem -X POST -H "X-Nomad-Token: $NOMAD_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"Job\": $(cat /tmp/job.json)}" \
+          https://10.10.0.110:4646/v1/jobs
+      - echo "Deployed sigil ($DEPLOY_SHA)"
