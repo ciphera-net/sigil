@@ -92,3 +92,7 @@ The container is a distroless static image holding only the server binary.
 `.woodpecker/` runs, as separate checks: `test` (`gofmt`, `go vet`,
 `go test -race`, including the SSRF suite), `govulncheck` (dependency-vuln
 scan), and — once the service lands — `build` / `push` / `deploy`.
+
+## License
+
+Licensed under the Apache License, Version 2.0 — see [LICENSE](./LICENSE). Contributions require a DCO sign-off; see [CONTRIBUTING.md](./CONTRIBUTING.md).
