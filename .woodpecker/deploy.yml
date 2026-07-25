@@ -1,3 +1,27 @@
+# Dual-target deploy: SKS cluster + Nomad, during the Phase-2 parallel run.
+# Generated from Infra/Kubernetes/workloads/_shared/ci-deploy/deploy.yml.template
+# with JOB=sigil  REPO=ciphera-net/sigil  CONTAINER=server.
+#
+# NO purge-cdn STEP, and that is correct rather than an omission: sigil has no Bunny
+# pull zone and no public hostname. It is reached only in-cluster, at
+# http://sigil.apps.svc.cluster.local — publishing an SSRF-guarded fetcher is
+# deliberately not done. See Infra/Kubernetes/workloads/sigil/sigil.yaml.
+#
+# NEVER use the dollar-brace variable form anywhere in this file — not in a command,
+# not in a comment. Woodpecker substitutes over the RAW FILE, comments included,
+# BEFORE the YAML is parsed. A shell flag written that way with a default became a
+# literal and turned a wedged rollout green (help pipeline 37); writing the form
+# inside a warning comment made the compiler reject the file outright (help pipelines
+# 38-40). Plain $VAR passes through untouched. CI_COMMIT_SHA below is the one
+# deliberate exception — that substring expansion is Woodpecker's own, by design.
+#
+# Secrets mount as a DIRECTORY (/opt/woodpecker/secrets), never as individual files.
+# token-sync publishes atomically (write .tmp, then mv); a rename swaps the inode, and
+# a single-FILE bind mount stays pinned to the inode that existed when the container
+# started — so a file mount can never observe a refreshed token. The previous version
+# of this file mounted /opt/woodpecker/secrets/nomad-token directly, which worked only
+# because the Nomad token is long-lived. The kube token is not (30m TTL).
+
 depends_on:
   - push
 
@@ -6,11 +30,10 @@ when:
     branch: main
 
 steps:
-  deploy:
+  # Resolve the immutable digest ONCE and hand the same value to both targets, so the
+  # two copies can never drift apart.
+  digest:
     image: alpine:3.20
-    volumes:
-      - /opt/woodpecker/secrets/nomad-token:/run/ci/nomad-token:ro
-      - /opt/vault-agent/tls/ca.pem:/run/ci/nomad-ca.pem:ro
     environment:
       REGISTRY_USERNAME:
         from_secret: registry_username
@@ -18,23 +41,163 @@ steps:
         from_secret: registry_password
     commands:
       - apk add --no-cache curl jq >/dev/null
-      - export NOMAD_TOKEN=$(cat /run/ci/nomad-token)
       - export DEPLOY_SHA=${CI_COMMIT_SHA:0:7}
       - |
-        DIGEST=$(curl -sfI -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+        DIGEST=$(curl -sfI --max-time 60 -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
           -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
           "https://registry.ops.ciphera.net/v2/ciphera-net/sigil/manifests/sha-$DEPLOY_SHA" \
           | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}')
-        test -n "$DIGEST"
+        case "$DIGEST" in
+          sha256:*) ;;
+          *) echo "digest resolution failed for sha-$DEPLOY_SHA (got [$DIGEST]) — did push finish?"; exit 1 ;;
+        esac
+        echo "$DIGEST"     > /woodpecker/digest
+        echo "$DEPLOY_SHA" > /woodpecker/deploy_sha
+      - echo "resolved sha-$DEPLOY_SHA -> $(cat /woodpecker/digest)"
+
+  deploy-k8s:
+    image: alpine:3.20
+    depends_on: [digest]
+    volumes:
+      # Short-lived ServiceAccount token from Vault's kubernetes secrets engine
+      # (role ci-deployer, 30m TTL), published by woodpecker-agent's token-sync.
+      # kube-ca.pem is REQUIRED — ci-ops' system CA bundle does NOT trust the SKS
+      # control-plane CA (measured: ssl_verify=20 without it, 0 with it).
+      - /opt/woodpecker/secrets:/run/ci:ro
+    environment:
+      KUBE_API: https://5d353b06-e84e-4c25-98b7-c0ec883da332.sks-ch-dk-2.exo.io
+    commands:
+      - apk add --no-cache curl jq >/dev/null
+      # Validated cross-step handoff. `export X=$(cat missing)` does NOT abort under
+      # errexit (export is a builtin and the list takes the builtin's status), so it
+      # silently yields empty and would PATCH `ciphera-net/sigil@` into the live
+      # Deployment. The apiserver does not validate image-reference syntax, so that is
+      # accepted and the pod then fails InvalidImageName with the old pod still serving.
       - |
-        curl -sf --cacert /run/ci/nomad-ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
-          https://10.10.0.110:4646/v1/job/sigil | jq \
+        DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
+        DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
+        case "$DIGEST" in sha256:*) ;; *) echo "bad digest handoff [$DIGEST]"; exit 1 ;; esac
+        [ -n "$DEPLOY_SHA" ] || { echo "empty deploy_sha handoff"; exit 1; }
+        export DIGEST DEPLOY_SHA
+      # Strategic-merge PATCH of image + deploy-sha annotation (the analogue of Nomad's
+      # .Meta.deploy_sha). fieldManager is set so a later `apply --server-side` reports
+      # an honest conflict on the image field instead of silently winning.
+      - |
+        BODY=$(jq -nc \
+          --arg img "registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST" \
+          --arg sha "$DEPLOY_SHA" \
+          '{spec:{template:{metadata:{annotations:{"ciphera.net/deploy-sha":$sha}},
+                            spec:{containers:[{name:"server",image:$img}]}}}}')
+        curl -fsS --max-time 30 --cacert /run/ci/kube-ca.pem -X PATCH \
+          -H "Authorization: Bearer $(cat /run/ci/kube-token)" \
+          -H "Content-Type: application/strategic-merge-patch+json" \
+          -d "$BODY" \
+          "$KUBE_API/apis/apps/v1/namespaces/apps/deployments/sigil?fieldManager=woodpecker-ci" >/dev/null
+      # Convergence gate. All four clauses are load-bearing; see the shared README.
+      # status.replicas == updatedReplicas is the one that stops the gate passing while
+      # an OLD pod is still serving. The token is re-read every iteration — it is
+      # non-renewable with a 30m TTL and this loop may run several minutes.
+      - |
+        CONVERGED=no
+        for i in $(seq 1 90); do
+          S=$(curl -fsS --max-time 15 --cacert /run/ci/kube-ca.pem \
+            -H "Authorization: Bearer $(cat /run/ci/kube-token)" \
+            "$KUBE_API/apis/apps/v1/namespaces/apps/deployments/sigil") \
+            || { echo "api read failed (iter $i) — retrying"; S=''; }
+          echo "$S" | jq -e '
+            ((.status.observedGeneration // 0) >= .metadata.generation)
+            and ((.status.updatedReplicas // 0) == .spec.replicas)
+            and ((.status.replicas // 0) == (.status.updatedReplicas // 0))
+            and ((.status.availableReplicas // 0) == (.status.updatedReplicas // 0))' >/dev/null \
+            && { echo "k8s rollout converged"; CONVERGED=yes; break; }
+          echo "$S" | jq -e '.status.conditions[]? | select(.type=="Progressing" and .reason=="ProgressDeadlineExceeded")' >/dev/null \
+            && { echo "k8s rollout FAILED (ProgressDeadlineExceeded)"; break; }
+          sleep 4
+        done
+        # A for loop that ends without breaking exits 0, so THIS post-loop check is what
+        # actually fails the step. It must not depend on any flag Woodpecker could have
+        # substituted away.
+        if [ "$CONVERGED" != "yes" ]; then
+          echo "--- pods in apps ---"
+          curl -fsS --max-time 15 --cacert /run/ci/kube-ca.pem \
+            -H "Authorization: Bearer $(cat /run/ci/kube-token)" \
+            "$KUBE_API/api/v1/namespaces/apps/pods" \
+            | jq -r '.items[] | select(.metadata.name | startswith("sigil")) | "\(.metadata.name) \(.status.phase) \([.status.containerStatuses[]?.state | keys[0]] | join(","))"' || true
+          echo "k8s rollout did NOT converge for sigil"
+          exit 1
+        fi
+      # Assert what is ACTUALLY running. Catches two things the gate structurally
+      # cannot: a wrong container name (strategic-merge keys containers on `name`, so
+      # it would return 200 and ADD a second container rather than fail), and a
+      # concurrent manifest apply that reverts the image while leaving the annotation
+      # still claiming this commit.
+      - |
+        O=$(curl -fsS --max-time 15 --retry 3 --retry-all-errors --cacert /run/ci/kube-ca.pem \
+          -H "Authorization: Bearer $(cat /run/ci/kube-token)" \
+          "$KUBE_API/apis/apps/v1/namespaces/apps/deployments/sigil")
+        echo "$O" | jq -e \
+          --arg img "registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST" \
+          --arg sha "$DEPLOY_SHA" '
+          ([.spec.template.spec.containers[].name] == ["server"])
+          and ((.spec.template.spec.containers[] | select(.name=="server") | .image) == $img)
+          and (.spec.template.metadata.annotations["ciphera.net/deploy-sha"] == $sha)' >/dev/null \
+          || { echo "POST-DEPLOY MISMATCH — running spec is not what we shipped:"; \
+               echo "$O" | jq '{containers:[.spec.template.spec.containers[]|{name,image}], sha:.spec.template.metadata.annotations["ciphera.net/deploy-sha"]}'; exit 1; }
+      - echo "Deployed sigil to SKS ($DEPLOY_SHA)"
+
+  # For sigil the Nomad job is NOT merely a rollback path — it is still the LIVE one.
+  # pulse-frontend-staging runs on Nomad and calls the VM copy at
+  # http://10.10.0.20:8085/icon over the privnet. Until that frontend is cut over,
+  # this step deploys the copy that is actually serving requests. Do not delete it
+  # with the usual decommission sweep; it goes when pulse-frontend-staging moves.
+  deploy-nomad:
+    image: alpine:3.20
+    depends_on: [digest]
+    volumes:
+      - /opt/woodpecker/secrets:/run/ci:ro
+      - /opt/vault-agent/tls:/run/vault-tls:ro
+    commands:
+      - apk add --no-cache curl jq >/dev/null
+      - |
+        DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
+        DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
+        case "$DIGEST" in sha256:*) ;; *) echo "bad digest handoff [$DIGEST]"; exit 1 ;; esac
+        export DIGEST DEPLOY_SHA
+      - |
+        NOMAD_TOKEN=$(cat /run/ci/nomad-token)
+        J=$(curl -sf --max-time 30 --cacert /run/vault-tls/ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
+          https://10.10.0.110:4646/v1/job/sigil) \
+          || { echo "LIVE NOMAD PATH FAILED — could not read Nomad job sigil"; exit 1; }
+        echo "$J" | jq -e '.ID' >/dev/null || { echo "LIVE NOMAD PATH FAILED — empty job response"; exit 1; }
+        echo "$J" | jq \
           ".Meta.deploy_sha = \"$DEPLOY_SHA\" |
            .TaskGroups[0].Tasks[0].Config.image = \"registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST\" |
            .TaskGroups[0].Tasks[0].Config.force_pull = true" > /tmp/job.json
-      - |
-        curl -fsS --cacert /run/ci/nomad-ca.pem -X POST -H "X-Nomad-Token: $NOMAD_TOKEN" \
+        curl -fsS --max-time 30 --cacert /run/vault-tls/ca.pem -X POST -H "X-Nomad-Token: $NOMAD_TOKEN" \
           -H "Content-Type: application/json" \
           -d "{\"Job\": $(cat /tmp/job.json)}" \
-          https://10.10.0.110:4646/v1/jobs
-      - echo "Deployed sigil ($DEPLOY_SHA)"
+          https://10.10.0.110:4646/v1/jobs >/dev/null
+      # Wait for THIS registration, version-bound. Nomad service jobs get a default
+      # Update{MaxParallel:1} even with no explicit update block, so a deployment
+      # object always exists — an unbound poll would read the PREVIOUS rollout's
+      # "successful" and break on iteration 1, gating nothing.
+      - |
+        NOMAD_TOKEN=$(cat /run/ci/nomad-token)
+        NEWV=$(curl -sf --max-time 30 --cacert /run/vault-tls/ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
+          https://10.10.0.110:4646/v1/job/sigil | jq -r '.Version // empty')
+        [ -n "$NEWV" ] || { echo "LIVE NOMAD PATH FAILED — could not read new job Version"; exit 1; }
+        echo "waiting for nomad job version $NEWV"
+        for i in $(seq 1 60); do
+          R=$(curl -sf --max-time 15 --cacert /run/vault-tls/ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
+            https://10.10.0.110:4646/v1/job/sigil/deployment) || R=''
+          S=$(printf '%s' "$R" | jq -r '.Status // "unreachable"' 2>/dev/null); [ -n "$S" ] || S=unreachable
+          V=$(printf '%s' "$R" | jq -r '.JobVersion // -1' 2>/dev/null)
+          echo "nomad deployment: $S (v$V, want v$NEWV)"
+          [ "$S" = "successful" ] && [ "$V" = "$NEWV" ] && { echo "nomad rollout converged"; break; }
+          if [ "$V" = "$NEWV" ]; then
+            case "$S" in failed|cancelled) echo "LIVE NOMAD PATH FAILED — nomad deploy $S"; exit 1 ;; esac
+          fi
+          [ "$i" = "60" ] && { echo "LIVE NOMAD PATH FAILED — nomad never converged (last=$S v$V)"; exit 1; }
+          sleep 5
+        done
+      - echo "Deployed sigil to Nomad ($DEPLOY_SHA)"
