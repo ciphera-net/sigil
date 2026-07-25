@@ -1,6 +1,18 @@
-# Dual-target deploy: SKS cluster + Nomad, during the Phase-2 parallel run.
-# Generated from Infra/Kubernetes/workloads/_shared/ci-deploy/deploy.yml.template
-# with JOB=sigil  REPO=ciphera-net/sigil  CONTAINER=server.
+# Cluster-only deploy: SKS. Originally generated from
+# Infra/Kubernetes/workloads/_shared/ci-deploy/deploy.yml.template with
+# JOB=sigil  REPO=ciphera-net/sigil  CONTAINER=server.
+#
+# The deploy-nomad step was REMOVED 25-07-2026, ending the Phase-2 parallel run for
+# this service. It had to go before the Nomad job was stopped: a stopped-but-unpurged
+# job still answers GET /v1/job/<id>, so the next deploy would have re-registered and
+# resurrected it.
+#
+# For sigil that step was the LIVE path, not a rollback path, because
+# pulse-frontend-staging called the VM copy at http://10.10.0.20:8085/icon over the
+# privnet. That is no longer true: FAVICON_UPSTREAM_URL now points at
+# http://sigil.apps.svc.cluster.local/icon, verified end to end through the public
+# staging edge before this step was removed (real image/png bodies, byte-identical to
+# the VM copy). That flip is what unblocked this removal.
 #
 # NO purge-cdn STEP, and that is correct rather than an omission: sigil has no Bunny
 # pull zone and no public hostname. It is reached only in-cluster, at
@@ -144,60 +156,3 @@ steps:
           || { echo "POST-DEPLOY MISMATCH — running spec is not what we shipped:"; \
                echo "$O" | jq '{containers:[.spec.template.spec.containers[]|{name,image}], sha:.spec.template.metadata.annotations["ciphera.net/deploy-sha"]}'; exit 1; }
       - echo "Deployed sigil to SKS ($DEPLOY_SHA)"
-
-  # For sigil the Nomad job is NOT merely a rollback path — it is still the LIVE one.
-  # pulse-frontend-staging runs on Nomad and calls the VM copy at
-  # http://10.10.0.20:8085/icon over the privnet. Until that frontend is cut over,
-  # this step deploys the copy that is actually serving requests. Do not delete it
-  # with the usual decommission sweep; it goes when pulse-frontend-staging moves.
-  deploy-nomad:
-    image: alpine:3.20
-    depends_on: [digest]
-    volumes:
-      - /opt/woodpecker/secrets:/run/ci:ro
-      - /opt/vault-agent/tls:/run/vault-tls:ro
-    commands:
-      - apk add --no-cache curl jq >/dev/null
-      - |
-        DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
-        DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
-        case "$DIGEST" in sha256:*) ;; *) echo "bad digest handoff [$DIGEST]"; exit 1 ;; esac
-        export DIGEST DEPLOY_SHA
-      - |
-        NOMAD_TOKEN=$(cat /run/ci/nomad-token)
-        J=$(curl -sf --max-time 30 --cacert /run/vault-tls/ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
-          https://10.10.0.110:4646/v1/job/sigil) \
-          || { echo "LIVE NOMAD PATH FAILED — could not read Nomad job sigil"; exit 1; }
-        echo "$J" | jq -e '.ID' >/dev/null || { echo "LIVE NOMAD PATH FAILED — empty job response"; exit 1; }
-        echo "$J" | jq \
-          ".Meta.deploy_sha = \"$DEPLOY_SHA\" |
-           .TaskGroups[0].Tasks[0].Config.image = \"registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST\" |
-           .TaskGroups[0].Tasks[0].Config.force_pull = true" > /tmp/job.json
-        curl -fsS --max-time 30 --cacert /run/vault-tls/ca.pem -X POST -H "X-Nomad-Token: $NOMAD_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "{\"Job\": $(cat /tmp/job.json)}" \
-          https://10.10.0.110:4646/v1/jobs >/dev/null
-      # Wait for THIS registration, version-bound. Nomad service jobs get a default
-      # Update{MaxParallel:1} even with no explicit update block, so a deployment
-      # object always exists — an unbound poll would read the PREVIOUS rollout's
-      # "successful" and break on iteration 1, gating nothing.
-      - |
-        NOMAD_TOKEN=$(cat /run/ci/nomad-token)
-        NEWV=$(curl -sf --max-time 30 --cacert /run/vault-tls/ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
-          https://10.10.0.110:4646/v1/job/sigil | jq -r '.Version // empty')
-        [ -n "$NEWV" ] || { echo "LIVE NOMAD PATH FAILED — could not read new job Version"; exit 1; }
-        echo "waiting for nomad job version $NEWV"
-        for i in $(seq 1 60); do
-          R=$(curl -sf --max-time 15 --cacert /run/vault-tls/ca.pem -H "X-Nomad-Token: $NOMAD_TOKEN" \
-            https://10.10.0.110:4646/v1/job/sigil/deployment) || R=''
-          S=$(printf '%s' "$R" | jq -r '.Status // "unreachable"' 2>/dev/null); [ -n "$S" ] || S=unreachable
-          V=$(printf '%s' "$R" | jq -r '.JobVersion // -1' 2>/dev/null)
-          echo "nomad deployment: $S (v$V, want v$NEWV)"
-          [ "$S" = "successful" ] && [ "$V" = "$NEWV" ] && { echo "nomad rollout converged"; break; }
-          if [ "$V" = "$NEWV" ]; then
-            case "$S" in failed|cancelled) echo "LIVE NOMAD PATH FAILED — nomad deploy $S"; exit 1 ;; esac
-          fi
-          [ "$i" = "60" ] && { echo "LIVE NOMAD PATH FAILED — nomad never converged (last=$S v$V)"; exit 1; }
-          sleep 5
-        done
-      - echo "Deployed sigil to Nomad ($DEPLOY_SHA)"
