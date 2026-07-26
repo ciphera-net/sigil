@@ -51,6 +51,16 @@ when:
 steps:
   # Resolve the immutable digest ONCE and hand the same value to both targets, so the
   # two copies can never drift apart.
+  # ⚠️ The Accept list MUST include application/vnd.oci.image.manifest.v1+json.
+  # kaniko INHERITS THE BASE IMAGE'S manifest media type, so the same plugin
+  # emits a Docker v2 manifest for a `FROM scratch` image and an OCI image
+  # manifest for an OCI base — i.e. the format varies per REPO, not per tool.
+  # With an incomplete Accept the registry does not merely 404: it can fall
+  # back to the legacy schema1 (`manifest.v1+prettyjws`) and return a DIFFERENT
+  # DIGEST for the same tag. Measured 27-07-2026: sigil sha-fb167fc resolved to
+  # ...39225e38 with the full list and ...0f8784ac with a partial one. Pinning a
+  # Deployment to that second value would ship something that is not the image
+  # that was built, and every gate downstream would still read green.
   digest:
     image: alpine:3.20
     # registry.ops.ciphera.net resolves to the cluster's own NLB. A pod dialling
@@ -69,7 +79,7 @@ steps:
       - export DEPLOY_SHA=${CI_COMMIT_SHA:0:7}
       - |
         DIGEST=$(curl -sfI --max-time 60 -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
-          -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+          -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
           "https://registry.ops.ciphera.net/v2/ciphera-net/sigil/manifests/sha-$DEPLOY_SHA" \
           | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}')
         case "$DIGEST" in
