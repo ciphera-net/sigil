@@ -1,3 +1,9 @@
+# Build and PUSH the image. Only on push to main, after build.yml passes.
+# See .woodpecker/build.yml for why this is kaniko and not buildx.
+
+labels:
+  runner: k8s
+
 depends_on:
   - build
 
@@ -7,10 +13,28 @@ when:
 
 steps:
   push:
-    image: woodpeckerci/plugin-docker-buildx:6.1.1
+    image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+    # 🔴 REQUIRED, and it is why this repo carries `trusted.network`.
+    #   registry.ops.ciphera.net resolves to the cluster's own NLB
+    #   (159.100.249.253). A pod dialling its own cluster's public load balancer
+    #   hits the Exoscale NLB hairpin: connections the NLB returns to the
+    #   ORIGINATING node are black-holed, so ~1/node_count of pushes die with
+    #     dial tcp 159.100.249.253:443: i/o timeout
+    #   Measured on the proof repo 27-07-2026 — one push succeeded, the next
+    #   timed out on exactly this. Pointing the name at Traefik's ClusterIP skips
+    #   the NLB entirely. Identical fix and reasoning to cert-manager's
+    #   hostAliases (Infra/Kubernetes/addons/30-cert-manager/values.yaml).
+    #
+    # ⚠️ 10.101.182.27 is a ClusterIP — NOT reachable from the ci-ops VM. That is
+    #   the other reason `labels: {runner: k8s}` above is load-bearing: this
+    #   workflow must never run on the Docker agent.
+    # ⚠️ The IP is pinned at service.spec.clusterIP in addons/20-traefik/values.yaml
+    #   precisely so a Traefik reinstall cannot move it out from under this.
+    extra_hosts:
+      - "registry.ops.ciphera.net:10.101.182.27"
     settings:
       registry: registry.ops.ciphera.net
-      repo: registry.ops.ciphera.net/ciphera-net/sigil
+      repo: ciphera-net/sigil          # NO hostname — see build.yml
       tags:
         - sha-${CI_COMMIT_SHA:0:7}
         - latest
@@ -18,6 +42,10 @@ steps:
         from_secret: registry_username
       password:
         from_secret: registry_password
-      cache_from:
-        - type=registry\,ref=registry.ops.ciphera.net/ciphera-net/sigil:buildcache
-      cache_to: type=registry,ref=registry.ops.ciphera.net/ciphera-net/sigil:buildcache,mode=max
+      # NOTE: no build cache yet, deliberately. buildx used a registry cache
+      # (`cache_from`/`cache_to`); kaniko's equivalent is `cache: true` +
+      # `cache-repo`, and it is NOT yet verified whether `cache-repo` also gets
+      # `registry` prepended the way `repo` does. Getting that wrong silently
+      # creates a junk repository in the registry, which is exactly the failure
+      # this file's other comments exist to prevent. Correctness first; add the
+      # cache once it is measured. Cost today is a slower build, not a wrong one.
