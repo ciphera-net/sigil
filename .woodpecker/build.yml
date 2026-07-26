@@ -1,3 +1,31 @@
+# Build validation. Runs on every push to main and on every PR.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY KANIKO AND NOT plugin-docker-buildx (changed 27-07-2026)
+#   CI is moving off the `ci-ops` VM and into the SKS cluster, which means the
+#   agent runs Woodpecker's KUBERNETES backend and every step is a pod.
+#
+#   buildx needs a PRIVILEGED container. On Nomad that privilege was granted
+#   SERVER-side by WOODPECKER_PLUGINS_PRIVILEGED, pinned to one exact image tag,
+#   specifically so no repo committer could self-elevate by writing
+#   `privileged: true` in their own pipeline.
+#
+#   ⚠️ WOODPECKER_PLUGINS_PRIVILEGED HAS NO EFFECT ON THE KUBERNETES BACKEND
+#   (upstream woodpecker-ci/woodpecker#6484, open). The only way to get a
+#   privileged step pod there is to mark the repo Trusted AND write
+#   `privileged: true` in the step — precisely the path that design refuses.
+#
+#   kaniko builds ROOTLESS, so no step needs privilege at all. That is why build
+#   pods can share the production node pool instead of needing an isolated one.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Routes this workflow to the in-cluster Kubernetes agent, which advertises
+# `!runner=k8s` — a MANDATORY label, so an agent is only eligible if the task
+# asks for it. Remove this line and the workflow falls back to the ci-ops Docker
+# agent; that is the rollback, and it is one line.
+labels:
+  runner: k8s
+
 when:
   - event: push
     branch: main
@@ -5,30 +33,18 @@ when:
 
 steps:
   build:
-    image: woodpeckerci/plugin-docker-buildx:6.1.1
+    image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
     settings:
-      dry_run: true
+      dry-run: true
       registry: registry.ops.ciphera.net
-      repo: registry.ops.ciphera.net/ciphera-net/sigil
+      # 🔴 NO registry hostname here. plugin-kaniko PREPENDS `registry` to `repo`;
+      # plugin-docker-buildx did not. Carrying the old value across produces
+      # registry.ops.ciphera.net/registry.ops.ciphera.net/... — and the pipeline
+      # still goes GREEN, because the push succeeds, just to a repo nothing pulls.
+      repo: ciphera-net/sigil
       tags:
         - sha-${CI_COMMIT_SHA:0:7}
-        - latest
       username:
         from_secret: registry_username
       password:
         from_secret: registry_password
-      cache_from:
-        - type=registry\,ref=registry.ops.ciphera.net/ciphera-net/sigil:buildcache
-      cache_to: type=registry,ref=registry.ops.ciphera.net/ciphera-net/sigil:buildcache,mode=max
-    when:
-      - event: push
-
-  build-pr:
-    image: woodpeckerci/plugin-docker-buildx:6.1.1
-    settings:
-      dry_run: true
-      repo: registry.ops.ciphera.net/ciphera-net/sigil
-      tags:
-        - sha-${CI_COMMIT_SHA:0:7}
-    when:
-      - event: pull_request

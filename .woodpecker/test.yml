@@ -1,3 +1,9 @@
+# Routes to the in-cluster Kubernetes agent (`!runner=k8s` is a MANDATORY
+# label there). No extra_hosts needed — this workflow never talks to the
+# registry, so it does not cross the NLB.
+labels:
+  runner: k8s
+
 when:
   - event: push
     branch: main
