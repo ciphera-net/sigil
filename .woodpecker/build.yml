@@ -31,6 +31,15 @@ when:
     branch: main
   - event: pull_request
 
+# 🔴 TWO STEPS, NOT ONE — and the split is a security boundary, not style.
+#   The org secrets `registry_username` / `registry_password` are scoped to the
+#   `push` and `tag` events ONLY, so that a pull request — which can come from a
+#   branch anyone with write access authored — never has registry credentials in
+#   its environment. Collapsing these into a single credentialed step makes the
+#   server refuse the pipeline outright:
+#     secret "registry_username" is not allowed to be used with pipeline event "pull_request"
+#   which is the guard working. Keep the PR variant credential-free.
+#   (Both are dry runs; nothing is pushed here. push.yml does the real push.)
 steps:
   build:
     image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
@@ -48,3 +57,18 @@ steps:
         from_secret: registry_username
       password:
         from_secret: registry_password
+    when:
+      - event: push
+
+  build-pr:
+    image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+    settings:
+      dry-run: true
+      # No `registry:`/`username:`/`password:` on purpose — see the block above.
+      # The Dockerfile's base images come from Docker Hub, so an unauthenticated
+      # dry run still proves the build compiles.
+      repo: ciphera-net/sigil
+      tags:
+        - sha-${CI_COMMIT_SHA:0:7}
+    when:
+      - event: pull_request
