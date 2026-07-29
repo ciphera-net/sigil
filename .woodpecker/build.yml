@@ -43,6 +43,15 @@ when:
 steps:
   build:
     image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+    # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
+    # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
+    # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see
+    # pulse-backend #147/#148). Sized by step class.
+    backend_options:
+      kubernetes:
+        resources:
+          requests: { memory: 2Gi, cpu: 1 }
+          limits: { memory: 6Gi }
     settings:
       dry-run: true
       registry: registry.ops.ciphera.net
@@ -62,6 +71,11 @@ steps:
 
   build-pr:
     image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+    backend_options:
+      kubernetes:
+        resources:
+          requests: { memory: 2Gi, cpu: 1 }
+          limits: { memory: 6Gi }
     settings:
       dry-run: true
       # No `registry:`/`username:`/`password:` on purpose — see the block above.
