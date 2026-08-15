@@ -203,3 +203,214 @@ steps:
           || { echo "POST-DEPLOY MISMATCH — running spec is not what we shipped:"; \
                echo "$O" | jq '{containers:[.spec.template.spec.containers[]|{name,image}], sha:.spec.template.metadata.annotations["ciphera.net/deploy-sha"]}'; exit 1; }
       - echo "Deployed sigil to SKS ($DEPLOY_SHA)"
+
+  # ═══ THE MAGIC CONTAINERS DEPLOY PATH ═══
+  # icons.ciphera.net is served by the Bunny Magic Containers app AvPpL5TEK3F07Kw,
+  # NOT by the cluster. Until now nothing in this repo knew MC existed: the gap was
+  # closed in-cluster by the `mc-image-sync` CronJob, which read the digest off the
+  # in-cluster Deployment and mirrored it. That job is being retired
+  # (Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md) together with
+  # the in-cluster Deployment it reads, so THIS step becomes the only path by which a
+  # merge to main reaches production.
+  #
+  # WHY THE BUNNY ACCOUNT KEY IS IN CI, when mc-image-sync's whole rationale was to
+  # keep it out: it was ALREADY here. `bunny_api_key` has been an ORG-LEVEL Woodpecker
+  # secret (org 2, events push+tag) readable by every repo's push pipelines, because
+  # CDN purging needs it. Refusing this step the credential while every neighbouring
+  # pipeline already holds it bought nothing. Owner decision 15-08-2026; the trade-off
+  # is written down in the plan above rather than left implied.
+  #
+  # ⚠️ The Bunny Container Registry has no scoped token — the registry credential IS
+  # the full-access account key (it can delete pull zones, change DNS and read every
+  # storage password). Nothing below may put it in argv or in a file that outlives the
+  # step.
+  bunny-push:
+    image: alpine:3.20
+    # 🟡 TRANSITIONAL: the `deploy-k8s` dependency exists ONLY while the in-cluster
+    # Deployment still runs. `mc-image-sync` reconciles MC *towards* the in-cluster
+    # digest every 20 minutes, so if this step landed first it would race — the CronJob
+    # would see MC ahead of the cluster, read that as drift, and PATCH production back
+    # to the OLD image until its next tick. Ordering behind the rollout makes the two
+    # writers agree by construction. Drop this dependency (leaving `digest`) in the same
+    # change that deletes `deploy-k8s`; this step never reads the cluster.
+    depends_on: [digest, deploy-k8s]
+    backend_options:
+      kubernetes:
+        resources:
+          # Larger than the other alpine steps: skopeo streams the whole image through
+          # this pod. BestEffort here means an eviction mid-copy, which presents as a
+          # registry error rather than as what it is.
+          requests: { memory: 512Mi, cpu: 250m }
+          limits: { memory: 1Gi }
+    # Same NLB-hairpin pin as every other step that touches this registry — skopeo
+    # PULLS from registry.ops here, so it is subject to the identical black-holing.
+    extra_hosts:
+      - "registry.ops.ciphera.net:10.101.182.27"
+    environment:
+      MC_APP_ID: AvPpL5TEK3F07Kw
+      MC_HOSTNAME: icons.ciphera.net
+      BUNNY_ACCOUNT: 90d844eb-838c-4c74-9c7a-c537bde7f3a2
+      BUNNY_REPO: sigil
+      OPS_IMAGE: registry.ops.ciphera.net/ciphera-net/sigil
+      # Rebuilt into the PATCH body in the WRITE shape. Sigil's health endpoint is on
+      # its own port, not the HTTP port — a frontend's is not the same, so this is per
+      # app rather than a shared default.
+      PROBE_PATH: /healthz
+      PROBE_PORT: "8085"
+      REGISTRY_USERNAME:
+        from_secret: registry_username
+      REGISTRY_PASSWORD:
+        from_secret: registry_password
+      BUNNY_API_KEY:
+        from_secret: bunny_api_key
+    commands:
+      # skopeo is in Alpine's community repo, which is the reason to use it: no NEW
+      # vendor image enters the estate (every prebuilt skopeo/crane image is hosted by
+      # a US company). Installed before anything else so a failure here cannot be
+      # mistaken for a registry problem.
+      - apk add --no-cache skopeo curl jq >/dev/null || { echo "apk add failed"; exit 1; }
+      - |
+        DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
+        DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
+        case "$DIGEST" in sha256:*) ;; *) echo "bad digest handoff [$DIGEST]"; exit 1 ;; esac
+        [ -n "$DEPLOY_SHA" ] || { echo "empty deploy_sha handoff"; exit 1; }
+        export DIGEST DEPLOY_SHA
+        echo "TAG=sha-$DEPLOY_SHA  DIGEST=$DIGEST"
+      # ═══ AUTHFILE ═══
+      # 🔴 registry.bunny.net requires the base64 `auth` FORM. A {username, password}
+      # entry is REJECTED as `unauthorized` — proven 13-08-2026 — and the failure looks
+      # exactly like a wrong credential, so it misdiagnoses as a bad key.
+      # 🔴 Built with jq `env.X`, NOT `--arg`: --arg would put the base64 credential in
+      # this process's argv, readable from /proc by anything sharing the pod. Same
+      # reason skopeo is never given --src-creds/--dest-creds.
+      # Written to /tmp (step-local), never /woodpecker (the shared workflow volume,
+      # which outlives this step and is visible to every other step).
+      - |
+        mkdir -p /tmp/regauth && chmod 700 /tmp/regauth
+        OPSAUTH=$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')
+        BAUTH=$(printf 'token:%s' "$BUNNY_API_KEY" | base64 | tr -d '\n')
+        export OPSAUTH BAUTH
+        jq -n '{auths: {"registry.ops.ciphera.net": {auth: env.OPSAUTH},
+                        "registry.bunny.net":       {auth: env.BAUTH}}}' \
+          > /tmp/regauth/auth.json || { echo "FAIL: building authfile"; exit 1; }
+        chmod 600 /tmp/regauth/auth.json
+        unset OPSAUTH BAUTH
+      # Copy BY DIGEST, tag by commit. Pulling @sha256 rather than :sha-xxx is what
+      # makes the two registries provably hold the same bytes — which is in turn what
+      # lets the verification below compare MC's imageDigest against the digest this
+      # pipeline resolved.
+      - |
+        skopeo copy --authfile /tmp/regauth/auth.json --retry-times 3 \
+          "docker://$OPS_IMAGE@$DIGEST" \
+          "docker://registry.bunny.net/$BUNNY_ACCOUNT/$BUNNY_REPO:sha-$DEPLOY_SHA" \
+          || { echo "FAIL: skopeo copy to registry.bunny.net"; exit 1; }
+      # ═══ RECORD WHAT WE ARE NOT SENDING, BEFORE WE SEND ═══
+      # The PATCH replaces the template, so the only way to prove it did not silently
+      # drop something is to know what was there first.
+      #   endpoints[].id + pullZoneId — losing these is DESTRUCTIVE, not merely wrong:
+      #     the pull zone goes with the endpoint and the hostname goes with the zone.
+      #   packageId — the container SIZE, and 🔴 the patch body DOES NOT SEND IT.
+      #     It is omitted because this body is the shape proven in production by
+      #     mc-image-sync, and adding an unproven field to a REPLACE is the larger
+      #     risk. Whether Bunny preserves an omitted packageId is UNVERIFIED — both MC
+      #     apps carry the same id, so their agreement proves nothing. So it is
+      #     asserted instead of assumed: if a REPLACE ever silently resizes the app,
+      #     this deploy fails loudly rather than quietly shrinking production.
+      - |
+        CUR=$(curl -sf --max-time 20 -H "AccessKey: $BUNNY_API_KEY" \
+              "https://api.bunny.net/mc/apps/$MC_APP_ID") \
+          || { echo "FAIL: could not read MC app $MC_APP_ID"; exit 1; }
+        echo "$CUR" > /tmp/mc-before.json
+        jq -c '{packageId: .containerTemplates[0].packageId,
+                endpoints: ([.containerTemplates[0].endpoints[] | {id, pullZoneId}] | sort_by(.id))}' \
+          /tmp/mc-before.json > /tmp/mc-invariants.json
+        echo "invariants before: $(cat /tmp/mc-invariants.json)"
+        [ "$(jq '.endpoints | length' /tmp/mc-invariants.json)" -ge 1 ] \
+          || { echo "FAIL: MC app already has no endpoints — refusing to touch it"; exit 1; }
+      # ═══ 🔴🔴 THE PATCH BODY IS LOAD-BEARING AND A NAIVE ONE IS DESTRUCTIVE ═══
+      # PATCH /mc/apps/{id} REPLACES containerTemplates — it does not merge. A body of
+      # {name, imageTag} returns 200 and wipes environmentVariables, probes AND
+      # endpoints; destroying the endpoint DELETES ITS PULL ZONE and takes the hostname
+      # down. That is exactly how icons.ciphera.net went down on 13-08-2026.
+      # Three properties make it an update instead:
+      #   * the FULL template (registry/namespace/name/tag/pullPolicy, env, probes,
+      #     endpoints) — a partial body is destructive, not rejected;
+      #   * endpoints in the WRITE shape (cdn:{portMappings}), NOT the READ shape the
+      #     GET returns (type/publicHost/pullZoneId);
+      #   * each endpoint's EXISTING `id`. Without it Bunny creates a new pull zone and
+      #     destroys the old one, hostname and certificate with it.
+      - |
+        jq --arg tag "sha-$DEPLOY_SHA" --arg pp "$PROBE_PATH" --argjson pn "$PROBE_PORT" '
+          .containerTemplates[0] as $t
+          | {containerTemplates: [{
+              id: $t.id, name: $t.name,
+              imageRegistryId: $t.imageRegistryId,
+              imageNamespace:  $t.imageNamespace,
+              imageName:       $t.imageName,
+              imageTag:        $tag,
+              imagePullPolicy: "Always",
+              environmentVariables: $t.environmentVariables,
+              probes: {
+                liveness:  {httpGet:{request:{path:$pp,portNumber:$pn}}},
+                readiness: {httpGet:{request:{path:$pp,portNumber:$pn}}}
+              },
+              endpoints: [ $t.endpoints[] | {
+                id: .id, displayName: .displayName,
+                cdn: {portMappings: [ .portMappings[] | {containerPort: .containerPort, port: 80} ]}
+              }]
+            }]}' /tmp/mc-before.json > /tmp/mc-patch.json \
+          || { echo "FAIL: building patch body"; exit 1; }
+        # Belt and braces against the exact 13-08 failure: never send a body that would
+        # drop the endpoint, whatever produced it.
+        EPC=$(jq '.containerTemplates[0].endpoints | length' /tmp/mc-patch.json)
+        [ "$EPC" -ge 1 ] || { echo "FAIL: patch body has no endpoints, refusing to send"; exit 1; }
+        NOID=$(jq '[.containerTemplates[0].endpoints[] | select(.id == null)] | length' /tmp/mc-patch.json)
+        [ "$NOID" = "0" ] \
+          || { echo "FAIL: $NOID endpoint(s) in the patch body have no id — sending this would MINT A NEW PULL ZONE and destroy $MC_HOSTNAME"; exit 1; }
+        echo "patch body: $EPC endpoint(s), all with ids, tag sha-$DEPLOY_SHA"
+      - |
+        curl -sf --max-time 30 -X PATCH -H "AccessKey: $BUNNY_API_KEY" \
+          -H 'Content-Type: application/json' -d @/tmp/mc-patch.json \
+          "https://api.bunny.net/mc/apps/$MC_APP_ID" >/dev/null \
+          || { echo "FAIL: PATCH /mc/apps/$MC_APP_ID"; exit 1; }
+      # ═══ 🔴 RE-GET. A 2xx IS NOT PROOF ═══
+      # This API silently discards fields it does not like, so success is defined as
+      # BOTH: the digest we shipped is live, AND everything we did NOT send is still
+      # there — same endpoint ids, same pull zone, same package. Checking imageDigest
+      # alone would report green on the change that took the hostname down on 13-08.
+      # Polled rather than slept: MC accepts the PATCH and reflects the new digest
+      # asynchronously, so a fixed sleep is either flaky or wasteful.
+      - |
+        OK=no; A_DIG=""; A_INV=""
+        WANT=$(cat /tmp/mc-invariants.json)
+        for i in $(seq 1 20); do
+          A=$(curl -sf --max-time 20 -H "AccessKey: $BUNNY_API_KEY" \
+              "https://api.bunny.net/mc/apps/$MC_APP_ID") \
+            || { echo "re-read failed (iter $i) — retrying"; sleep 5; continue; }
+          A_DIG=$(echo "$A" | jq -r '.containerTemplates[0].imageDigest')
+          A_INV=$(echo "$A" | jq -c '{packageId: .containerTemplates[0].packageId,
+                                      endpoints: ([.containerTemplates[0].endpoints[] | {id, pullZoneId}] | sort_by(.id))}')
+          if [ "$A_DIG" = "$DIGEST" ] && [ "$A_INV" = "$WANT" ]; then
+            OK=yes; echo "MC now runs $A_DIG; invariants intact: $A_INV"; break
+          fi
+          sleep 5
+        done
+        if [ "$OK" != "yes" ]; then
+          echo "--- expected digest: $DIGEST"
+          echo "--- actual digest:   $A_DIG"
+          echo "--- invariants before: $WANT"
+          echo "--- invariants after:  $A_INV"
+          if [ "$A_INV" != "$WANT" ]; then
+            echo "🔴 THE PATCH CHANGED SOMETHING IT DID NOT SEND."
+            echo "🔴 If endpoints or pullZoneId moved, $MC_HOSTNAME MAY BE DOWN and its pull zone may be GONE."
+            echo "🔴 Restore per Infra/MagicContainers/sigil/README.md; verify the pull zone still exists before re-running."
+          fi
+          echo "FAIL: MC did not converge on the shipped image with its configuration intact"
+          exit 1
+        fi
+      # A rollout across 42 regions is PROGRESSIVE — roughly 10 minutes, measured
+      # 15-08-2026. This step returning green means MC is CONFIGURED to run the new
+      # image, not that every region already serves it. There is deliberately no purge
+      # here: a purge fired now lands before convergence and simply re-caches the old
+      # build (measured — see mc-image-sync's manifest for the full reasoning).
+      - echo "Magic Containers app $MC_APP_ID set to sha-$DEPLOY_SHA ($MC_HOSTNAME) — rollout across 42 regions takes ~10 min"
