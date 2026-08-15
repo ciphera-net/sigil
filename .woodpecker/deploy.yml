@@ -1,23 +1,36 @@
-# Cluster-only deploy: SKS. Originally generated from
-# Infra/Kubernetes/workloads/_shared/ci-deploy/deploy.yml.template with
-# JOB=sigil  REPO=ciphera-net/sigil  CONTAINER=server.
+# Magic-Containers-only deploy. Sigil does NOT run in the cluster.
+#
+# ═══ THE CLUSTER DEPLOY WAS REMOVED 15-08-2026 ═══
+# `deploy-k8s` is gone, and so is the Deployment it targeted: sigil now exists ONLY as
+# the Bunny Magic Containers app AvPpL5TEK3F07Kw behind icons.ciphera.net, across 42
+# regions. Plan: Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md.
+#
+# That makes `bunny-push` below the ONE path by which a merge reaches production. There
+# is no second copy, no fallback resolver, and nothing that repairs a missed push — a
+# failed deploy leaves Magic Containers on the previous image. Treat that step's guards
+# and its re-GET verification as load-bearing rather than defensive clutter.
+#
+# ⚠️ ORDER MATTERED WHEN THIS LANDED, and it is worth recording because the reverse
+# would have been a silent production rollback. Until 15-08 the MC app was kept current
+# by the in-cluster `mc-image-sync` CronJob, which reconciles MC *towards* the
+# in-cluster Deployment's digest. Removing `deploy-k8s` while that Deployment still
+# existed would have left the cluster copy STALE — and the CronJob would then have read
+# MC as "drifted ahead" and PATCHed production BACK to the older image. The CronJob was
+# therefore suspended BEFORE this step was removed, and the Deployment deleted straight
+# after. Deleting the Deployment is itself safe (the job fails closed on
+# `bad live digest []`); leaving it behind, stale, is the dangerous state.
 #
 # The deploy-nomad step was REMOVED 25-07-2026, ending the Phase-2 parallel run for
 # this service. It had to go before the Nomad job was stopped: a stopped-but-unpurged
 # job still answers GET /v1/job/<id>, so the next deploy would have re-registered and
 # resurrected it.
 #
-# For sigil that step was the LIVE path, not a rollback path, because
-# pulse-frontend-staging called the VM copy at http://10.10.0.20:8085/icon over the
-# privnet. That is no longer true: FAVICON_UPSTREAM_URL now points at
-# http://sigil.apps.svc.cluster.local/icon, verified end to end through the public
-# staging edge before this step was removed (real image/png bodies, byte-identical to
-# the VM copy). That flip is what unblocked this removal.
-#
-# NO purge-cdn STEP, and that is correct rather than an omission: sigil has no Bunny
-# pull zone and no public hostname. It is reached only in-cluster, at
-# http://sigil.apps.svc.cluster.local — publishing an SSRF-guarded fetcher is
-# deliberately not done. See Infra/Kubernetes/workloads/sigil/sigil.yaml.
+# NO purge-cdn STEP. This used to be justified by "sigil has no Bunny pull zone and no
+# public hostname", which is NO LONGER TRUE — it has zone 6332045 and serves
+# icons.ciphera.net. The step is still correct to omit, for a different reason: an MC
+# rollout is PROGRESSIVE (~10 min for 42 regions), so a purge fired at the end of this
+# pipeline lands before convergence and simply re-caches the old build. Measured
+# 15-08-2026; the same purge was tried inside mc-image-sync and removed for this reason.
 #
 # NEVER use the dollar-brace variable form anywhere in this file — not in a command,
 # not in a comment. Woodpecker substitutes over the RAW FILE, comments included,
@@ -49,8 +62,11 @@ when:
     branch: main
 
 steps:
-  # Resolve the immutable digest ONCE and hand the same value to both targets, so the
-  # two copies can never drift apart.
+  # Resolve the immutable digest once, and hand it to bunny-push. It used to feed TWO
+  # targets (the cluster Deployment and Magic Containers) so the copies could not drift;
+  # since 15-08-2026 there is only one target, but resolving the digest rather than
+  # trusting the tag still matters — the copy to registry.bunny.net is done BY DIGEST,
+  # which is what makes MC's imageDigest comparable to what this pipeline built.
   # ⚠️ The Accept list MUST include application/vnd.oci.image.manifest.v1+json.
   # kaniko INHERITS THE BASE IMAGE'S manifest media type, so the same plugin
   # emits a Docker v2 manifest for a `FROM scratch` image and an OCI image
@@ -99,119 +115,13 @@ steps:
         echo "$DEPLOY_SHA" > /woodpecker/deploy_sha
       - echo "resolved sha-$DEPLOY_SHA -> $(cat /woodpecker/digest)"
 
-  deploy-k8s:
-    image: alpine:3.20
-    depends_on: [digest]
-    backend_options:
-      kubernetes:
-        resources:
-          requests: { memory: 128Mi, cpu: 100m }
-          limits: { memory: 512Mi }
-    # NO volume, deliberately — this is the whole point of running in-cluster.
-    #
-    # On ci-ops this step bind-mounted /opt/woodpecker/secrets:/run/ci:ro, a host
-    # directory into which the agent's `token-sync` task republished a 30-minute
-    # Vault-issued ServiceAccount token plus the SKS control-plane CA every 30s.
-    # All of that existed only because CI ran OUTSIDE the cluster and had no
-    # Kubernetes identity of its own.
-    #
-    # A step pod has one automatically: the kubelet projects a rotating token and
-    # the API server's CA at /var/run/secrets/kubernetes.io/serviceaccount/, and
-    # the API is reachable in-cluster at kubernetes.default.svc. So the token-sync
-    # mechanism, the host mount and the Vault round trip all disappear, and the
-    # credential is now bound to this pod instead of readable by anything sharing
-    # a VM. Permissions come from the ci-deployer RoleBinding
-    # (Infra/Kubernetes/workloads/_shared/ci-deployer.yaml), which binds
-    # woodpecker-builds/default.
-    environment:
-      KUBE_API: https://kubernetes.default.svc
-    commands:
-      - apk add --no-cache curl jq >/dev/null
-      # Validated cross-step handoff. `export X=$(cat missing)` does NOT abort under
-      # errexit (export is a builtin and the list takes the builtin's status), so it
-      # silently yields empty and would PATCH `ciphera-net/sigil@` into the live
-      # Deployment. The apiserver does not validate image-reference syntax, so that is
-      # accepted and the pod then fails InvalidImageName with the old pod still serving.
-      - |
-        DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
-        DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
-        case "$DIGEST" in sha256:*) ;; *) echo "bad digest handoff [$DIGEST]"; exit 1 ;; esac
-        [ -n "$DEPLOY_SHA" ] || { echo "empty deploy_sha handoff"; exit 1; }
-        export DIGEST DEPLOY_SHA
-      # Strategic-merge PATCH of image + deploy-sha annotation (the analogue of Nomad's
-      # .Meta.deploy_sha). fieldManager is set so a later `apply --server-side` reports
-      # an honest conflict on the image field instead of silently winning.
-      - |
-        BODY=$(jq -nc \
-          --arg img "registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST" \
-          --arg sha "$DEPLOY_SHA" \
-          '{spec:{template:{metadata:{annotations:{"ciphera.net/deploy-sha":$sha}},
-                            spec:{containers:[{name:"server",image:$img}]}}}}')
-        curl -fsS --max-time 30 --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -X PATCH \
-          -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
-          -H "Content-Type: application/strategic-merge-patch+json" \
-          -d "$BODY" \
-          "$KUBE_API/apis/apps/v1/namespaces/apps/deployments/sigil?fieldManager=woodpecker-ci" >/dev/null
-      # Convergence gate. All four clauses are load-bearing; see the shared README.
-      # status.replicas == updatedReplicas is the one that stops the gate passing while
-      # an OLD pod is still serving. The token is re-read every iteration — it is
-      # non-renewable with a 30m TTL and this loop may run several minutes.
-      - |
-        CONVERGED=no
-        for i in $(seq 1 90); do
-          S=$(curl -fsS --max-time 15 --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-            -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
-            "$KUBE_API/apis/apps/v1/namespaces/apps/deployments/sigil") \
-            || { echo "api read failed (iter $i) — retrying"; S=''; }
-          echo "$S" | jq -e '
-            ((.status.observedGeneration // 0) >= .metadata.generation)
-            and ((.status.updatedReplicas // 0) == .spec.replicas)
-            and ((.status.replicas // 0) == (.status.updatedReplicas // 0))
-            and ((.status.availableReplicas // 0) == (.status.updatedReplicas // 0))' >/dev/null \
-            && { echo "k8s rollout converged"; CONVERGED=yes; break; }
-          echo "$S" | jq -e '.status.conditions[]? | select(.type=="Progressing" and .reason=="ProgressDeadlineExceeded")' >/dev/null \
-            && { echo "k8s rollout FAILED (ProgressDeadlineExceeded)"; break; }
-          sleep 4
-        done
-        # A for loop that ends without breaking exits 0, so THIS post-loop check is what
-        # actually fails the step. It must not depend on any flag Woodpecker could have
-        # substituted away.
-        if [ "$CONVERGED" != "yes" ]; then
-          echo "--- pods in apps ---"
-          curl -fsS --max-time 15 --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-            -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
-            "$KUBE_API/api/v1/namespaces/apps/pods" \
-            | jq -r '.items[] | select(.metadata.name | startswith("sigil")) | "\(.metadata.name) \(.status.phase) \([.status.containerStatuses[]?.state | keys[0]] | join(","))"' || true
-          echo "k8s rollout did NOT converge for sigil"
-          exit 1
-        fi
-      # Assert what is ACTUALLY running. Catches two things the gate structurally
-      # cannot: a wrong container name (strategic-merge keys containers on `name`, so
-      # it would return 200 and ADD a second container rather than fail), and a
-      # concurrent manifest apply that reverts the image while leaving the annotation
-      # still claiming this commit.
-      - |
-        O=$(curl -fsS --max-time 15 --retry 3 --retry-all-errors --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-          -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
-          "$KUBE_API/apis/apps/v1/namespaces/apps/deployments/sigil")
-        echo "$O" | jq -e \
-          --arg img "registry.ops.ciphera.net/ciphera-net/sigil@$DIGEST" \
-          --arg sha "$DEPLOY_SHA" '
-          ([.spec.template.spec.containers[].name] == ["server"])
-          and ((.spec.template.spec.containers[] | select(.name=="server") | .image) == $img)
-          and (.spec.template.metadata.annotations["ciphera.net/deploy-sha"] == $sha)' >/dev/null \
-          || { echo "POST-DEPLOY MISMATCH — running spec is not what we shipped:"; \
-               echo "$O" | jq '{containers:[.spec.template.spec.containers[]|{name,image}], sha:.spec.template.metadata.annotations["ciphera.net/deploy-sha"]}'; exit 1; }
-      - echo "Deployed sigil to SKS ($DEPLOY_SHA)"
-
   # ═══ THE MAGIC CONTAINERS DEPLOY PATH ═══
   # icons.ciphera.net is served by the Bunny Magic Containers app AvPpL5TEK3F07Kw,
-  # NOT by the cluster. Until now nothing in this repo knew MC existed: the gap was
-  # closed in-cluster by the `mc-image-sync` CronJob, which read the digest off the
-  # in-cluster Deployment and mirrored it. That job is being retired
-  # (Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md) together with
-  # the in-cluster Deployment it reads, so THIS step becomes the only path by which a
-  # merge to main reaches production.
+  # NOT by the cluster. This is THE deploy path — the only way a merge to main reaches
+  # production. Until 15-08-2026 the gap was closed in-cluster by the `mc-image-sync`
+  # CronJob, which read the digest off the in-cluster Deployment and mirrored it; that
+  # job and that Deployment are both retired
+  # (Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md).
   #
   # WHY THE BUNNY ACCOUNT KEY IS IN CI, when mc-image-sync's whole rationale was to
   # keep it out: it was ALREADY here. `bunny_api_key` has been an ORG-LEVEL Woodpecker
@@ -226,14 +136,10 @@ steps:
   # step.
   bunny-push:
     image: alpine:3.20
-    # 🟡 TRANSITIONAL: the `deploy-k8s` dependency exists ONLY while the in-cluster
-    # Deployment still runs. `mc-image-sync` reconciles MC *towards* the in-cluster
-    # digest every 20 minutes, so if this step landed first it would race — the CronJob
-    # would see MC ahead of the cluster, read that as drift, and PATCH production back
-    # to the OLD image until its next tick. Ordering behind the rollout makes the two
-    # writers agree by construction. Drop this dependency (leaving `digest`) in the same
-    # change that deletes `deploy-k8s`; this step never reads the cluster.
-    depends_on: [digest, deploy-k8s]
+    # The `deploy-k8s` dependency this carried until 15-08-2026 is gone with the step
+    # itself. It existed to stop `mc-image-sync` racing this one; both are retired, and
+    # this step never read the cluster in the first place.
+    depends_on: [digest]
     backend_options:
       kubernetes:
         resources:
