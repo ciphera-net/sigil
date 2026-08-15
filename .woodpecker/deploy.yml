@@ -2,8 +2,8 @@
 #
 # ═══ THE CLUSTER DEPLOY WAS REMOVED 15-08-2026 ═══
 # `deploy-k8s` is gone, and so is the Deployment it targeted: sigil now exists ONLY as
-# the Bunny Magic Containers app AvPpL5TEK3F07Kw behind icons.ciphera.net, across 42
-# regions. Plan: Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md.
+# a Bunny Magic Containers app behind icons.ciphera.net, across 42 regions.
+# Plan: Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md.
 #
 # That makes `bunny-push` below the ONE path by which a merge reaches production. There
 # is no second copy, no fallback resolver, and nothing that repairs a missed push — a
@@ -26,7 +26,7 @@
 # resurrected it.
 #
 # NO purge-cdn STEP. This used to be justified by "sigil has no Bunny pull zone and no
-# public hostname", which is NO LONGER TRUE — it has zone 6332045 and serves
+# public hostname", which is NO LONGER TRUE — it has a Bunny pull zone and serves
 # icons.ciphera.net. The step is still correct to omit, for a different reason: an MC
 # rollout is PROGRESSIVE (~10 min for 42 regions), so a purge fired at the end of this
 # pipeline lands before convergence and simply re-caches the old build. Measured
@@ -116,24 +116,18 @@ steps:
       - echo "resolved sha-$DEPLOY_SHA -> $(cat /woodpecker/digest)"
 
   # ═══ THE MAGIC CONTAINERS DEPLOY PATH ═══
-  # icons.ciphera.net is served by the Bunny Magic Containers app AvPpL5TEK3F07Kw,
-  # NOT by the cluster. This is THE deploy path — the only way a merge to main reaches
-  # production. Until 15-08-2026 the gap was closed in-cluster by the `mc-image-sync`
+  # icons.ciphera.net is served by a Bunny Magic Containers app, NOT by the cluster.
+  # This is THE deploy path — the only way a merge to main reaches production. Until 15-08-2026 the gap was closed in-cluster by the `mc-image-sync`
   # CronJob, which read the digest off the in-cluster Deployment and mirrored it; that
   # job and that Deployment are both retired
   # (Infra/docs/plans/15-08-2026-mc-decommission-in-cluster-copies.md).
   #
-  # WHY THE BUNNY ACCOUNT KEY IS IN CI, when mc-image-sync's whole rationale was to
-  # keep it out: it was ALREADY here. `bunny_api_key` has been an ORG-LEVEL Woodpecker
-  # secret (org 2, events push+tag) readable by every repo's push pipelines, because
-  # CDN purging needs it. Refusing this step the credential while every neighbouring
-  # pipeline already holds it bought nothing. Owner decision 15-08-2026; the trade-off
-  # is written down in the plan above rather than left implied.
+  # Credential handling, and why it is shaped the way it is, is recorded in the plan
+  # referenced above rather than here — this file is public.
   #
-  # ⚠️ The Bunny Container Registry has no scoped token — the registry credential IS
-  # the full-access account key (it can delete pull zones, change DNS and read every
-  # storage password). Nothing below may put it in argv or in a file that outlives the
-  # step.
+  # ⚠️ Bunny publishes no scoped registry token; the documented registry login is the
+  # account API key (their docs say so). Treat `bunny_api_key` accordingly: nothing
+  # below may put it in argv, echo it, or write it anywhere that outlives this step.
   bunny-push:
     image: alpine:3.20
     # The `deploy-k8s` dependency this carried until 15-08-2026 is gone with the step
@@ -153,9 +147,20 @@ steps:
     extra_hosts:
       - "registry.ops.ciphera.net:10.101.182.27"
     environment:
-      MC_APP_ID: AvPpL5TEK3F07Kw
+      # 🔴 THIS REPO IS PUBLIC. Account and app identifiers come from Woodpecker
+      # secrets, not literals. They are not credentials — nothing here is
+      # exploitable without `bunny_api_key` — but committing them to a public tree
+      # tells a reader exactly which account to attack and which secret is worth
+      # taking, which is free information we do not need to give away. The same
+      # reasoning the estate already applies to hostnames and registry paths.
+      #   bunny_account  org-level  (shared with every repo that talks to Bunny)
+      #   mc_app_id      repo-level (one MC app per repo)
+      MC_APP_ID:
+        from_secret: mc_app_id
+      BUNNY_ACCOUNT:
+        from_secret: bunny_account
+      # Public by definition — it is the hostname users resolve.
       MC_HOSTNAME: icons.ciphera.net
-      BUNNY_ACCOUNT: 90d844eb-838c-4c74-9c7a-c537bde7f3a2
       BUNNY_REPO: sigil
       OPS_IMAGE: registry.ops.ciphera.net/ciphera-net/sigil
       # Rebuilt into the PATCH body in the WRITE shape. Sigil's health endpoint is on
