@@ -299,11 +299,37 @@ steps:
       # makes the two registries provably hold the same bytes — which is in turn what
       # lets the verification below compare MC's imageDigest against the digest this
       # pipeline resolved.
+      #
+      # ⚠️ THE OUTER RETRY LOOP IS NOT BELT-AND-BRACES — `--retry-times` DOES NOT COVER
+      # THIS. MEASURED 15-08-2026, sigil pipeline 38: the Bunny registry returned
+      #   500 Internal Server Error
+      # on a blob upload (PUT .../blobs/uploads/<uuid>?digest=sha256:...) and skopeo
+      # exited `fatal` immediately, with --retry-times 3 already set. A plain restart of
+      # the same pipeline then succeeded, so the 500 is transient upstream flakiness
+      # rather than anything about this image. Logged in Infra/docs/bunny-beta-feedback.md.
+      #
+      # That matters more than a normal flake because this step is the ONLY path by
+      # which a merge reaches production — a failure here does not fall back to
+      # anything, it just leaves Magic Containers on the previous image.
+      #
+      # Retrying is SAFE to do blindly: the copy is idempotent (same digest, same tag)
+      # and it happens BEFORE any mutation of the MC app, so every failure in this
+      # phase is a no-op against production.
       - |
-        skopeo copy --authfile /tmp/regauth/auth.json --retry-times 3 \
-          "docker://$OPS_IMAGE@$DIGEST" \
-          "docker://registry.bunny.net/$BUNNY_ACCOUNT/$BUNNY_REPO:sha-$DEPLOY_SHA" \
-          || { echo "FAIL: skopeo copy to registry.bunny.net"; exit 1; }
+        COPIED=no
+        for attempt in 1 2 3 4 5; do
+          if skopeo copy --authfile /tmp/regauth/auth.json --retry-times 3 \
+               "docker://$OPS_IMAGE@$DIGEST" \
+               "docker://registry.bunny.net/$BUNNY_ACCOUNT/$BUNNY_REPO:sha-$DEPLOY_SHA"; then
+            COPIED=yes; break
+          fi
+          echo "skopeo copy attempt $attempt failed — retrying in $((attempt * 10))s"
+          sleep $((attempt * 10))
+        done
+        # A `for` loop that ends without breaking exits 0, so THIS check is what fails
+        # the step — same shape as the rollout gate above, for the same reason.
+        [ "$COPIED" = "yes" ] \
+          || { echo "FAIL: skopeo copy to registry.bunny.net after 5 attempts"; exit 1; }
       # ═══ RECORD WHAT WE ARE NOT SENDING, BEFORE WE SEND ═══
       # The PATCH replaces the template, so the only way to prove it did not silently
       # drop something is to know what was there first.
