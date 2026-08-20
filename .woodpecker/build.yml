@@ -1,3 +1,29 @@
+# 🔴 THIS WORKFLOW IS PULL-REQUEST ONLY (20-08-2026). It used to also run on
+# push/main, where it was PURE WASTE — measured and removed.
+#
+# WHAT IT WAS. The build.yml -> push.yml split is a recorded owner decision
+# (Infra/docs/plans/10-07-2026-woodpecker-ci-migration-design.md §10): under
+# buildx, build.yml ran `dry_run: true` AND EXPORTED A REGISTRY CACHE, and
+# push.yml then did a warm-cache assemble+push. The second build was nearly free
+# by design, and the accepted cost was one extra clone, bought in exchange for a
+# separate GitHub check per file.
+#
+# WHAT BROKE IT. The 27-07-2026 kaniko port dropped the cache and left the split
+# standing. kaniko's plugin.sh sets `CACHE=""` whenever `dry-run: true`, so a
+# dry-run build CANNOT warm anything — the main-branch build became a full
+# rebuild of the identical Dockerfile whose output is thrown away, sitting on the
+# critical path via push.yml's `depends_on`.
+#
+# MEASURED: 153s mean per affected pipeline across ten repos, 5.34 h/month,
+# 12.3% of ALL CI wall-clock. Here: build 40s + push 45s.
+# Proven on website-backend #54 first: 190s -> 105s, -45%.
+#
+# ⚠️ THE PR GATE IS THE POINT AND IT STAYS. `build-pr` still validates the
+# Dockerfile on every pull request, with NO registry credentials, so a broken
+# Dockerfile is caught before merge — which is where it should be caught. What
+# was deleted is only the re-validation of an already-validated Dockerfile on
+# the way to a build that happens seconds later anyway.
+# See Infra/docs/audits/20-08-2026-ci-latency-audit.md §5.1.
 # Build validation. Runs on every push to main and on every PR.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,8 +53,6 @@ labels:
   runner: k8s
 
 when:
-  - event: push
-    branch: main
   - event: pull_request
 
 # 🔴 TWO STEPS, NOT ONE — and the split is a security boundary, not style.
@@ -41,34 +65,6 @@ when:
 #   which is the guard working. Keep the PR variant credential-free.
 #   (Both are dry runs; nothing is pushed here. push.yml does the real push.)
 steps:
-  build:
-    image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
-    # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
-    # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
-    # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see
-    # pulse-backend #147/#148). Sized by step class.
-    backend_options:
-      kubernetes:
-        resources:
-          requests: { memory: 2Gi, cpu: 1 }
-          limits: { memory: 6Gi }
-    settings:
-      dry-run: true
-      registry: registry.ops.ciphera.net
-      # 🔴 NO registry hostname here. plugin-kaniko PREPENDS `registry` to `repo`;
-      # plugin-docker-buildx did not. Carrying the old value across produces
-      # registry.ops.ciphera.net/registry.ops.ciphera.net/... — and the pipeline
-      # still goes GREEN, because the push succeeds, just to a repo nothing pulls.
-      repo: ciphera-net/sigil
-      tags:
-        - sha-${CI_COMMIT_SHA:0:7}
-      username:
-        from_secret: registry_username
-      password:
-        from_secret: registry_password
-    when:
-      - event: push
-
   build-pr:
     image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
     backend_options:
