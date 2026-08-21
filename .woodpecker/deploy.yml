@@ -54,6 +54,16 @@
 labels:
   runner: k8s
 
+# 🔑 skip_clone (21-08-2026). NOT ONE STEP IN THIS WORKFLOW READS THE REPOSITORY.
+# Every step touches only /woodpecker/digest, /woodpecker/deploy_sha,
+# /tmp/mc-invariants.json and the pod's own ServiceAccount token.
+# Cloning to run curl and jq cost ~19s per pipeline across nine deploy workflows;
+# measured 20-08-2026 and deferred into this migration because it touches the same
+# files. If a step ever DOES start reading a repo file it fails loudly and
+# immediately on a missing path, not silently on stale content.
+# See Infra/docs/audits/20-08-2026-ci-latency-audit.md §5.5 and §16 item 8.
+skip_clone: true
+
 depends_on:
   - push
 
