@@ -264,10 +264,16 @@ steps:
       #     asserted instead of assumed: if a REPLACE ever silently resizes the app,
       #     this deploy fails loudly rather than quietly shrinking production.
       - |
-        CUR=$(curl -sf --max-time 20 -H "AccessKey: $BUNNY_API_KEY" \
+        # 🔑 STATUS CAPTURED, NOT SWALLOWED (21-08-2026). This exact call failed
+        # twice today during Bunny-side incidents and `curl -sf` reported no
+        # reason — "could not read MC app" with nothing to act on. -f collapses
+        # every HTTP error into rc=22; capturing the code names the failure.
+        HTTP=$(curl -s --max-time 20 -o /tmp/mc-before.json -w '%{http_code}' \
+              -H "AccessKey: $BUNNY_API_KEY" \
               "https://api.bunny.net/mc/apps/$MC_APP_ID") \
-          || { echo "FAIL: could not read MC app $MC_APP_ID"; exit 1; }
-        echo "$CUR" > /tmp/mc-before.json
+          || { echo "FAIL: GET /mc/apps/$MC_APP_ID — curl transport error rc=$?"; exit 1; }
+        [ "$HTTP" = "200" ] \
+          || { echo "FAIL: GET /mc/apps/$MC_APP_ID -> HTTP $HTTP"; head -c 300 /tmp/mc-before.json; echo; exit 1; }
         jq -c '{packageId: .containerTemplates[0].packageId,
                 endpoints: ([.containerTemplates[0].endpoints[] | {id, pullZoneId}] | sort_by(.id))}' \
           /tmp/mc-before.json > /tmp/mc-invariants.json
@@ -316,10 +322,18 @@ steps:
           || { echo "FAIL: $NOID endpoint(s) in the patch body have no id — sending this would MINT A NEW PULL ZONE and destroy $MC_HOSTNAME"; exit 1; }
         echo "patch body: $EPC endpoint(s), all with ids, tag sha-$DEPLOY_SHA"
       - |
-        curl -sf --max-time 30 -X PATCH -H "AccessKey: $BUNNY_API_KEY" \
+        # 🔑 Same status-capture as the GET above — the 21-08 Bunny incidents made
+        # this exact line fail with no diagnosis. A PATCH that is refused must
+        # say HOW it was refused, or the on-call is debugging blind.
+        HTTP=$(curl -s --max-time 30 -o /tmp/mc-patch-resp -w '%{http_code}' \
+          -X PATCH -H "AccessKey: $BUNNY_API_KEY" \
           -H 'Content-Type: application/json' -d @/tmp/mc-patch.json \
-          "https://api.bunny.net/mc/apps/$MC_APP_ID" >/dev/null \
-          || { echo "FAIL: PATCH /mc/apps/$MC_APP_ID"; exit 1; }
+          "https://api.bunny.net/mc/apps/$MC_APP_ID") \
+          || { echo "FAIL: PATCH /mc/apps/$MC_APP_ID — curl transport error rc=$?"; exit 1; }
+        case "$HTTP" in
+          2*) echo "PATCH accepted (HTTP $HTTP)" ;;
+          *) echo "FAIL: PATCH /mc/apps/$MC_APP_ID -> HTTP $HTTP"; head -c 400 /tmp/mc-patch-resp; echo; exit 1 ;;
+        esac
       # ═══ 🔴 RE-GET. A 2xx IS NOT PROOF ═══
       # This API silently discards fields it does not like, so success is defined as
       # BOTH: the digest we shipped is live, AND everything we did NOT send is still
