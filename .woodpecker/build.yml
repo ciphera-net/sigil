@@ -1,84 +1,88 @@
-# 🔴 THIS WORKFLOW IS PULL-REQUEST ONLY (20-08-2026). It used to also run on
-# push/main, where it was PURE WASTE — measured and removed.
-#
-# WHAT IT WAS. The build.yml -> push.yml split is a recorded owner decision
-# (Infra/docs/plans/10-07-2026-woodpecker-ci-migration-design.md §10): under
-# buildx, build.yml ran `dry_run: true` AND EXPORTED A REGISTRY CACHE, and
-# push.yml then did a warm-cache assemble+push. The second build was nearly free
-# by design, and the accepted cost was one extra clone, bought in exchange for a
-# separate GitHub check per file.
-#
-# WHAT BROKE IT. The 27-07-2026 kaniko port dropped the cache and left the split
-# standing. kaniko's plugin.sh sets `CACHE=""` whenever `dry-run: true`, so a
-# dry-run build CANNOT warm anything — the main-branch build became a full
-# rebuild of the identical Dockerfile whose output is thrown away, sitting on the
-# critical path via push.yml's `depends_on`.
-#
-# MEASURED: 153s mean per affected pipeline across ten repos, 5.34 h/month,
-# 12.3% of ALL CI wall-clock. Here: build 40s + push 45s.
-# Proven on website-backend #54 first: 190s -> 105s, -45%.
-#
-# ⚠️ THE PR GATE IS THE POINT AND IT STAYS. `build-pr` still validates the
-# Dockerfile on every pull request, with NO registry credentials, so a broken
-# Dockerfile is caught before merge — which is where it should be caught. What
-# was deleted is only the re-validation of an already-validated Dockerfile on
-# the way to a build that happens seconds later anyway.
-# See Infra/docs/audits/20-08-2026-ci-latency-audit.md §5.1.
-# Build validation. Runs on every push to main and on every PR.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# WHY KANIKO AND NOT plugin-docker-buildx (changed 27-07-2026)
-#   CI is moving off the `ci-ops` VM and into the SKS cluster, which means the
-#   agent runs Woodpecker's KUBERNETES backend and every step is a pod.
-#
-#   buildx needs a PRIVILEGED container. On Nomad that privilege was granted
-#   SERVER-side by WOODPECKER_PLUGINS_PRIVILEGED, pinned to one exact image tag,
-#   specifically so no repo committer could self-elevate by writing
-#   `privileged: true` in their own pipeline.
-#
-#   ⚠️ WOODPECKER_PLUGINS_PRIVILEGED HAS NO EFFECT ON THE KUBERNETES BACKEND
-#   (upstream woodpecker-ci/woodpecker#6484, open). The only way to get a
-#   privileged step pod there is to mark the repo Trusted AND write
-#   `privileged: true` in the step — precisely the path that design refuses.
-#
-#   kaniko builds ROOTLESS, so no step needs privilege at all. That is why build
-#   pods can share the production node pool instead of needing an isolated one.
-# ─────────────────────────────────────────────────────────────────────────────
-
 # Routes this workflow to the in-cluster Kubernetes agent, which advertises
-# `!runner=k8s` — a MANDATORY label, so an agent is only eligible if the task
-# asks for it. Remove this line and the workflow falls back to the ci-ops Docker
-# agent; that is the rollback, and it is one line.
+# `!runner=k8s` — a MANDATORY label, so an agent is only eligible when the task
+# asks for it.
+#
+# ════════════════════════════════════════════════════════════════════════════════
+# BUILDER: rootless BuildKit, replacing kaniko (21-08-2026)
+# ════════════════════════════════════════════════════════════════════════════════
+# WHAT THIS USED TO BE. `woodpeckerci/plugin-kaniko:2.3.2` with `dry-run: true`. Google ARCHIVED
+# GoogleContainerTools/kaniko on 3 June 2025 — read-only, no CVE fixes — and the
+# plugin we ran was three forks deep, based on an individual's Docker Hub
+# namespace. Continuity, not speed, is why it is gone.
+# Plan: Infra/docs/plans/20-08-2026-buildkit-rootless-migration.md
+# As-built + measurements: Infra/docs/21-08-2026-buildkit-execution-record.md
+#
+# WHY BUILDKIT IS ALLOWED NOW WHEN plugin-docker-buildx WAS NOT (27-07-2026):
+# buildx needs a PRIVILEGED step container, and on the Kubernetes backend the only
+# route to that is repo-Trusted plus `privileged: true` in the step — i.e. exactly
+# the self-elevation path that decision refused. This step needs NO privilege: it
+# runs `buildctl`, a thin client that streams the build context to the SHARED
+# daemon (`buildkitd` in the `buildkit` namespace) and streams logs back. All
+# privilege lives in that daemon's manifest, which no committer can edit from here.
+#
+# ⚠️ THE DAEMON IS SHARED BY THE WHOLE ESTATE. A transport error here is an
+# estate-wide problem, not a repo problem — check the `BuildkitdDown` alert first.
+#
+# 🔑 NO `--output` IS THE DRY RUN. kaniko had `dry-run: true`; buildctl's
+# equivalent is simply omitting the output. Verified 21-08-2026 against the live
+# daemon: every stage builds, `RUN` steps execute, and the command exits 0 with
+# nothing pushed and no image assembled. A broken Dockerfile still fails here,
+# before merge, which is the entire purpose of this gate.
+#
+# 🔑 THIS GATE IMPORTS THE CACHE BUT DELIBERATELY DOES NOT EXPORT IT.
+# Importing makes the PR gate fast. Exporting is left to `push.yml` on `main`
+# so the shared bucket only ever holds layers from merged code, and abandoned PR
+# branches cannot grow it without bound.
 labels:
   runner: k8s
 
 when:
   - event: pull_request
 
-# 🔴 TWO STEPS, NOT ONE — and the split is a security boundary, not style.
-#   The org secrets `registry_username` / `registry_password` are scoped to the
-#   `push` and `tag` events ONLY, so that a pull request — which can come from a
-#   branch anyone with write access authored — never has registry credentials in
-#   its environment. Collapsing these into a single credentialed step makes the
-#   server refuse the pipeline outright:
-#     secret "registry_username" is not allowed to be used with pipeline event "pull_request"
-#   which is the guard working. Keep the PR variant credential-free.
-#   (Both are dry runs; nothing is pushed here. push.yml does the real push.)
 steps:
   build-pr:
-    image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+    image: moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+    # 🔑 Down from 2Gi request / 6Gi limit under kaniko. The work MOVED rather than shrank: kaniko
+    # compiled and snapshotted inside THIS pod, whereas buildctl only streams the
+    # context to the daemon and prints progress. The build memory now lives once in
+    # buildkitd instead of once per concurrent build pod — a straight win for
+    # cluster headroom and for the CSI/concurrency arithmetic in
+    # woodpecker-agent.yaml.
     backend_options:
       kubernetes:
         resources:
-          requests: { memory: 2Gi, cpu: 1 }
-          limits: { memory: 6Gi }
-    settings:
-      dry-run: true
-      # No `registry:`/`username:`/`password:` on purpose — see the block above.
-      # The Dockerfile's base images come from Docker Hub, so an unauthenticated
-      # dry run still proves the build compiles.
-      repo: ciphera-net/sigil
-      tags:
-        - sha-${CI_COMMIT_SHA:0:7}
-    when:
-      - event: pull_request
+          requests: { memory: 256Mi, cpu: 200m }
+          limits: { memory: 768Mi }
+    # NOTE: no `extra_hosts`. The registry hairpin pin moved to the DAEMON
+    # (hostAliases in buildkitd.yaml) because the daemon, not this client, talks to
+    # registry.ops.ciphera.net. This step never contacts it.
+    environment:
+      BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
+      CACHE_ENDPOINT: https://sos-ch-dk-2.exo.io
+      CACHE_BUCKET: ciphera-build-cache
+      CACHE_REGION: ch-dk-2
+      CACHE_NAME: sigil
+    commands:
+      # 🔴 SOVEREIGNTY TRIPWIRE. BuildKit's s3 cache backend sets an explicit S3
+      # endpoint only when `endpoint_url` is non-empty
+      # (cache/remotecache/s3/s3.go: `if config.EndpointURL != ""`); otherwise the
+      # AWS SDK resolves its own default, which is AWS. A typo would ship our build
+      # cache to a US provider. The daemon carries AWS_ENDPOINT_URL_S3 as a
+      # backstop for the OMITTED case (measured: an endpoint-less export still
+      # landed in SOS), but an endpoint that is merely WRONG overrides that
+      # backstop — so assert it here, where the value is written.
+      - |
+        case "$CACHE_ENDPOINT" in
+          https://sos-*.exo.io) echo "cache endpoint OK: $CACHE_ENDPOINT" ;;
+          *) echo "REFUSING: cache endpoint '$CACHE_ENDPOINT' is not Exoscale SOS"; exit 1 ;;
+        esac
+      # No --output: build everything, assemble nothing, push nothing.
+      - |
+        buildctl build \
+          --frontend dockerfile.v0 \
+          --local context=. \
+          --local dockerfile=. \
+          --opt filename=Dockerfile \
+          --import-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME" \
+          --progress plain
+      - echo "Dockerfile validated (no image produced, nothing pushed)"

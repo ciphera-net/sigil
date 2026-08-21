@@ -1,15 +1,39 @@
-# Build and PUSH the image. Only on push to main, after build.yml passes.
-# See .woodpecker/build.yml for why this is kaniko and not buildx.
-
+# Routes this workflow to the in-cluster Kubernetes agent, which advertises
+# `!runner=k8s` — a MANDATORY label, so an agent is only eligible when the task
+# asks for it.
+#
+# ════════════════════════════════════════════════════════════════════════════════
+# BUILDER: rootless BuildKit, replacing kaniko (21-08-2026)
+# ════════════════════════════════════════════════════════════════════════════════
+# WHAT THIS USED TO BE. `woodpeckerci/plugin-kaniko:2.3.2`, with the build cache deliberately left OFF
+# because kaniko's `cache-repo` semantics were unverified. Google ARCHIVED
+# GoogleContainerTools/kaniko on 3 June 2025 — read-only, no CVE fixes — and the
+# plugin we ran was three forks deep, based on an individual's Docker Hub
+# namespace. Continuity, not speed, is why it is gone.
+# Plan: Infra/docs/plans/20-08-2026-buildkit-rootless-migration.md
+# As-built + measurements: Infra/docs/21-08-2026-buildkit-execution-record.md
+#
+# WHY BUILDKIT IS ALLOWED NOW WHEN plugin-docker-buildx WAS NOT (27-07-2026):
+# buildx needs a PRIVILEGED step container, and on the Kubernetes backend the only
+# route to that is repo-Trusted plus `privileged: true` in the step — i.e. exactly
+# the self-elevation path that decision refused. This step needs NO privilege: it
+# runs `buildctl`, a thin client that streams the build context to the SHARED
+# daemon (`buildkitd` in the `buildkit` namespace) and streams logs back. All
+# privilege lives in that daemon's manifest, which no committer can edit from here.
+#
+# ⚠️ THE DAEMON IS SHARED BY THE WHOLE ESTATE. A transport error here is an
+# estate-wide problem, not a repo problem — check the `BuildkitdDown` alert first.
+#
+# 🔑 THE CACHE LIVES IN EXOSCALE SOS, NOT IN THE REGISTRY, AND THAT IS DELIBERATE.
+# `registry.ops.ciphera.net` still has NO garbage collection: it is execution-gated
+# after the 29-06-2026 incident in which a tag-keyed GC deleted the blobs of 11 of
+# 12 deployed images. A `mode=max` cache exports far more layers than kaniko ever
+# would, so putting it there means unbounded growth or un-gating that GC first.
+# ⚠️ Expiry is the `build-cache-prune` CronJob in the `buildkit` namespace, NOT an
+# S3 lifecycle rule: SOS bucket lifecycle is Exoscale Early Access and is not
+# enabled on this account — it accepts the PUT with HTTP 200 and stores nothing.
 labels:
   runner: k8s
-
-# `depends_on: [build]` REMOVED 20-08-2026 (build.yml is pull-request only now).
-# On a push there is no `build` workflow to wait for, and what it used to wait
-# for was a discarded rebuild of this very image. This step is now the FIRST and
-# ONLY build on main, which is what makes the deletion safe: a Dockerfile
-# that does not build still fails the pipeline here, before deploy.yml can ship.
-# See Infra/docs/audits/20-08-2026-ci-latency-audit.md §5.1.
 
 when:
   - event: push
@@ -17,48 +41,65 @@ when:
 
 steps:
   push:
-    image: woodpeckerci/plugin-kaniko:2.3.2@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
-    # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
-    # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
-    # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see
-    # pulse-backend #147/#148). Sized by step class.
+    image: moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+    # 🔑 Down from 2Gi request / 6Gi limit under kaniko — the compile moved into the shared daemon.
     backend_options:
       kubernetes:
         resources:
-          requests: { memory: 2Gi, cpu: 1 }
-          limits: { memory: 6Gi }
-    # 🔴 REQUIRED, and it is why this repo carries `trusted.network`.
-    #   registry.ops.ciphera.net resolves to the cluster's own NLB
-    #   (159.100.249.253). A pod dialling its own cluster's public load balancer
-    #   hits the Exoscale NLB hairpin: connections the NLB returns to the
-    #   ORIGINATING node are black-holed, so ~1/node_count of pushes die with
-    #     dial tcp 159.100.249.253:443: i/o timeout
-    #   Measured on the proof repo 27-07-2026 — one push succeeded, the next
-    #   timed out on exactly this. Pointing the name at Traefik's ClusterIP skips
-    #   the NLB entirely. Identical fix and reasoning to cert-manager's
-    #   hostAliases (Infra/Kubernetes/addons/30-cert-manager/values.yaml).
-    #
-    # ⚠️ 10.101.182.27 is a ClusterIP — NOT reachable from the ci-ops VM. That is
-    #   the other reason `labels: {runner: k8s}` above is load-bearing: this
-    #   workflow must never run on the Docker agent.
-    # ⚠️ The IP is pinned at service.spec.clusterIP in addons/20-traefik/values.yaml
-    #   precisely so a Traefik reinstall cannot move it out from under this.
-    extra_hosts:
-      - "registry.ops.ciphera.net:10.101.182.27"
-    settings:
-      registry: registry.ops.ciphera.net
-      repo: ciphera-net/sigil          # NO hostname — see build.yml
-      tags:
-        - sha-${CI_COMMIT_SHA:0:7}
-        - latest
-      username:
+          requests: { memory: 256Mi, cpu: 200m }
+          limits: { memory: 768Mi }
+    # NOTE: `extra_hosts` is GONE and its absence is correct. The Exoscale NLB
+    # hairpin pin for registry.ops.ciphera.net moved to the DAEMON (hostAliases in
+    # buildkitd.yaml) because the DAEMON performs the push — buildctl only hands it
+    # the image name and forwards credentials over the session. Verified 21-08-2026
+    # from inside the daemon: GET https://registry.ops.ciphera.net/v2/ -> HTTP 401.
+    environment:
+      BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
+      CACHE_ENDPOINT: https://sos-ch-dk-2.exo.io
+      CACHE_BUCKET: ciphera-build-cache
+      CACHE_REGION: ch-dk-2
+      CACHE_NAME: sigil
+      REGISTRY: registry.ops.ciphera.net
+      IMAGE_REPO: ciphera-net/sigil
+      IMAGE_TAG: sha-${CI_COMMIT_SHA:0:7}
+      REGISTRY_USERNAME:
         from_secret: registry_username
-      password:
+      REGISTRY_PASSWORD:
         from_secret: registry_password
-      # NOTE: no build cache yet, deliberately. buildx used a registry cache
-      # (`cache_from`/`cache_to`); kaniko's equivalent is `cache: true` +
-      # `cache-repo`, and it is NOT yet verified whether `cache-repo` also gets
-      # `registry` prepended the way `repo` does. Getting that wrong silently
-      # creates a junk repository in the registry, which is exactly the failure
-      # this file's other comments exist to prevent. Correctness first; add the
-      # cache once it is measured. Cost today is a slower build, not a wrong one.
+    commands:
+      # 🔴 SOVEREIGNTY TRIPWIRE — see build.yml for the full reasoning.
+      - |
+        case "$CACHE_ENDPOINT" in
+          https://sos-*.exo.io) echo "cache endpoint OK: $CACHE_ENDPOINT" ;;
+          *) echo "REFUSING: cache endpoint '$CACHE_ENDPOINT' is not Exoscale SOS"; exit 1 ;;
+        esac
+      # buildctl reads the client's docker config and forwards the credential to the
+      # daemon PER BUILD over the session. That is what keeps the registry push
+      # credential subject to Woodpecker's per-repo trust and event gating — the
+      # daemon holds no standing registry credential of its own, deliberately (its
+      # Vault policy refuses kv/shared/ci-registry for exactly this reason).
+      # `base64 | tr -d` rather than `base64 -w0`: this is BusyBox base64.
+      - |
+        mkdir -p /root/.docker
+        AUTH=$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')
+        printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > /root/.docker/config.json
+        chmod 600 /root/.docker/config.json
+      # 🔑 A GREEN STEP PROVES THE CACHE WAS WRITTEN. A failed `--export-cache` is
+      # FATAL, not a warning — `ignore-error` defaults to false and is not set.
+      # Measured 21-08-2026 against a non-existent bucket: exit=1, "api error
+      # NoSuchBucket". So there is no separate post-flight check: this step
+      # succeeding IS the check, and the credential only works against SOS.
+      #
+      # The `name=` value carries a comma to publish two tags, so it must be QUOTED
+      # INSIDE the CSV or buildctl reads `latest` as a separate attribute.
+      - |
+        buildctl build \
+          --frontend dockerfile.v0 \
+          --local context=. \
+          --local dockerfile=. \
+          --opt filename=Dockerfile \
+          --import-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME" \
+          --export-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME,mode=max" \
+          --output "type=image,\"name=$REGISTRY/$IMAGE_REPO:$IMAGE_TAG,$REGISTRY/$IMAGE_REPO:latest\",push=true" \
+          --progress plain
+      - echo "pushed $REGISTRY/$IMAGE_REPO:$IMAGE_TAG and :latest"
