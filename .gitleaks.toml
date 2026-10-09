@@ -1,0 +1,20 @@
+# gitleaks config for pulse-backend secret GATING (OPS-9).
+# Keeps all of gitleaks' default rules, and allowlists paths where fake credentials live by
+# design — test files and test-data fixtures. Everywhere else, a detected secret fails the
+# `security` check (gitleaks --exit-code 1). Triage 08-10-2026: every pre-existing finding was a
+# fixture in one of these paths; see Infra/docs/plans/08-10-2026-ci-security-scanning.md.
+#
+# ⚠️ Trade-off: a real secret committed INSIDE a test file would not be caught. Accepted for v1
+# (test fixtures legitimately carry fake creds). Tighten later with a fingerprint baseline if needed.
+title = "pulse-backend gitleaks"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures carry fake credentials by design"
+paths = [
+  '''.*_test\.go$''',
+  '''.*/dataimporttest/.*''',
+  '''.*/testdata/.*''',
+]
