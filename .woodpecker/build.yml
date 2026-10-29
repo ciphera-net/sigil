@@ -58,9 +58,9 @@ steps:
     # registry.ops.ciphera.net. This step never contacts it.
     environment:
       BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
-      CACHE_ENDPOINT: https://sos-ch-dk-2.exo.io
+      CACHE_ENDPOINT: https://s3.pub1.infomaniak.cloud
       CACHE_BUCKET: ciphera-build-cache
-      CACHE_REGION: ch-dk-2
+      CACHE_REGION: us-east-1
       CACHE_NAME: sigil
     commands:
       # 🔴 SOVEREIGNTY TRIPWIRE. BuildKit's s3 cache backend sets an explicit S3
@@ -69,12 +69,12 @@ steps:
       # AWS SDK resolves its own default, which is AWS. A typo would ship our build
       # cache to a US provider. The daemon carries AWS_ENDPOINT_URL_S3 as a
       # backstop for the OMITTED case (measured: an endpoint-less export still
-      # landed in SOS), but an endpoint that is merely WRONG overrides that
+      # landed in the bucket), but an endpoint that is merely WRONG overrides that
       # backstop — so assert it here, where the value is written.
       - |
         case "$CACHE_ENDPOINT" in
-          https://sos-*.exo.io) echo "cache endpoint OK: $CACHE_ENDPOINT" ;;
-          *) echo "REFUSING: cache endpoint '$CACHE_ENDPOINT' is not Exoscale SOS"; exit 1 ;;
+          https://s3.pub1.infomaniak.cloud) echo "cache endpoint OK: $CACHE_ENDPOINT" ;;
+          *) echo "REFUSING: cache endpoint '$CACHE_ENDPOINT' is not Infomaniak object storage (pub1)"; exit 1 ;;
         esac
       # No --output: build everything, assemble nothing, push nothing.
       - |
