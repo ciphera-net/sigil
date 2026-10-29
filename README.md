@@ -68,7 +68,7 @@ would fail our tests rather than silently ship.
 
     go get github.com/ciphera-net/sigil/pkg/favicon
 
-Requires **Go 1.25+**.
+Requires **Go 1.26.10+** (Go 1.25 is end-of-life).
 
 ## API (service)
 
