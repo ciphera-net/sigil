@@ -22,5 +22,7 @@ steps:
           requests: { memory: 1Gi, cpu: 500m }
           limits: { memory: 3Gi }
     commands:
-      - go install golang.org/x/vuln/cmd/govulncheck@latest
+      # Pinned: golang.org/x/vuln v1.8.0 and later require Go 1.26, and the golang:1.25 image sets
+      # GOTOOLCHAIN=local, so `@latest` fails to install. Bump it with the move to Go 1.26.
+      - go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
       - govulncheck ./...
