@@ -24,14 +24,14 @@
 # ⚠️ THE DAEMON IS SHARED BY THE WHOLE ESTATE. A transport error here is an
 # estate-wide problem, not a repo problem — check the `BuildkitdDown` alert first.
 #
-# 🔑 THE CACHE LIVES IN EXOSCALE SOS, NOT IN THE REGISTRY, AND THAT IS DELIBERATE.
+# 🔑 THE CACHE LIVES IN OBJECT STORAGE, NOT IN THE REGISTRY, AND THAT IS DELIBERATE.
 # `registry.ops.ciphera.net` still has NO garbage collection: it is execution-gated
 # after the 29-06-2026 incident in which a tag-keyed GC deleted the blobs of 11 of
 # 12 deployed images. A `mode=max` cache exports far more layers than kaniko ever
 # would, so putting it there means unbounded growth or un-gating that GC first.
 # ⚠️ Expiry is the `build-cache-prune` CronJob in the `buildkit` namespace, NOT an
-# S3 lifecycle rule: SOS bucket lifecycle is Exoscale Early Access and is not
-# enabled on this account — it accepts the PUT with HTTP 200 and stores nothing.
+# S3 lifecycle rule: neither Exoscale SOS nor Infomaniak object storage (since
+# 29-10-2026) keeps one; both accept or answer the call and store nothing.
 labels:
   runner: k8s
 
@@ -55,9 +55,9 @@ steps:
     # from inside the daemon: GET https://registry.ops.ciphera.net/v2/ -> HTTP 401.
     environment:
       BUILDKIT_HOST: tcp://buildkitd.buildkit.svc.cluster.local:1234
-      CACHE_ENDPOINT: https://sos-ch-dk-2.exo.io
+      CACHE_ENDPOINT: https://s3.pub1.infomaniak.cloud
       CACHE_BUCKET: ciphera-build-cache
-      CACHE_REGION: ch-dk-2
+      CACHE_REGION: us-east-1
       CACHE_NAME: sigil
       REGISTRY: registry.ops.ciphera.net
       IMAGE_REPO: ciphera-net/sigil
@@ -70,8 +70,8 @@ steps:
       # 🔴 SOVEREIGNTY TRIPWIRE — see build.yml for the full reasoning.
       - |
         case "$CACHE_ENDPOINT" in
-          https://sos-*.exo.io) echo "cache endpoint OK: $CACHE_ENDPOINT" ;;
-          *) echo "REFUSING: cache endpoint '$CACHE_ENDPOINT' is not Exoscale SOS"; exit 1 ;;
+          https://s3.pub1.infomaniak.cloud) echo "cache endpoint OK: $CACHE_ENDPOINT" ;;
+          *) echo "REFUSING: cache endpoint '$CACHE_ENDPOINT' is not Infomaniak object storage (pub1)"; exit 1 ;;
         esac
       # buildctl reads the client's docker config and forwards the credential to the
       # daemon PER BUILD over the session. That is what keeps the registry push
@@ -84,11 +84,13 @@ steps:
         AUTH=$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')
         printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > /root/.docker/config.json
         chmod 600 /root/.docker/config.json
-      # 🔑 A GREEN STEP PROVES THE CACHE WAS WRITTEN. A failed `--export-cache` is
-      # FATAL, not a warning — `ignore-error` defaults to false and is not set.
-      # Measured 21-08-2026 against a non-existent bucket: exit=1, "api error
-      # NoSuchBucket". So there is no separate post-flight check: this step
-      # succeeding IS the check, and the credential only works against SOS.
+      # 🔑 A CACHE NEVER FAILS A DEPLOY (29-10-2026): `ignore-error=true`, so a failed export
+      # prints an ERROR line and the step stays green. The proof that exports land is the
+      # BuildCacheNotWritten alert (newest cache manifest older than 48h). `touch_refresh=87600h`
+      # turns BuildKit's daily self-copy "touch" off: on Infomaniak object storage (Swift) it
+      # orphans the parts of every multipart blob it touches. Expiry is build-cache-prune's job
+      # (blobs no manifest references). BuildKit parses the duration with time.ParseDuration
+      # and a typo silently falls back to 24h, so keep the value exactly as written.
       #
       # The `name=` value carries a comma to publish two tags, so it must be QUOTED
       # INSIDE the CSV or buildctl reads `latest` as a separate attribute.
@@ -99,7 +101,7 @@ steps:
           --local dockerfile=. \
           --opt filename=Dockerfile \
           --import-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME" \
-          --export-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME,mode=max" \
+          --export-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME,mode=max,ignore-error=true,touch_refresh=87600h" \
           --output "type=image,\"name=$REGISTRY/$IMAGE_REPO:$IMAGE_TAG,$REGISTRY/$IMAGE_REPO:latest\",push=true" \
           --progress plain
       - echo "pushed $REGISTRY/$IMAGE_REPO:$IMAGE_TAG and :latest"
