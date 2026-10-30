@@ -11,7 +11,7 @@ when:
 
 steps:
   unit:
-    image: golang:1.25
+    image: golang:1.26
     # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
     # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
     # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see

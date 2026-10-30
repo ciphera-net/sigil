@@ -11,7 +11,7 @@ when:
 
 steps:
   govulncheck:
-    image: golang:1.25
+    image: golang:1.26
     # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
     # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
     # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see
@@ -22,5 +22,7 @@ steps:
           requests: { memory: 1Gi, cpu: 500m }
           limits: { memory: 3Gi }
     commands:
-      - go install golang.org/x/vuln/cmd/govulncheck@latest
+      # Pinned, and bumped on purpose: an unpinned `@latest` broke this step when x/vuln v1.8.0
+      # raised its floor to Go 1.26 (the golang images set GOTOOLCHAIN=local).
+      - go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
       - govulncheck ./...
