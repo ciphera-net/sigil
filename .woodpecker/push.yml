@@ -91,6 +91,16 @@ steps:
       # orphans the parts of every multipart blob it touches. Expiry is build-cache-prune's job
       # (blobs no manifest references). BuildKit parses the duration with time.ParseDuration
       # and a typo silently falls back to 24h, so keep the value exactly as written.
+      # 🔴 `oci-mediatypes=false` is LOAD-BEARING, not a style choice. BuildKit
+      # defaults to OCI media types; kaniko (which this replaced on 21-08-2026)
+      # inherited the base image's, which was Docker v2. Bunny Magic Containers'
+      # image puller sends an Accept header listing ONLY the Docker types, so it
+      # cannot read an OCI manifest at all — measured 02-11-2026 against our own
+      # registry with Bunny's own header: the OCI tag answered 404 and a Docker v2
+      # tag of the same repo answered 200. Dropping this option makes the image
+      # unpullable by MC, which is the only way icons.ciphera.net is deployed.
+      # Docker v2 is read by everything else we run (containerd, skopeo, the
+      # cluster), so this costs nothing and is strictly more compatible.
       #
       # The `name=` value carries a comma to publish two tags, so it must be QUOTED
       # INSIDE the CSV or buildctl reads `latest` as a separate attribute.
@@ -102,6 +112,6 @@ steps:
           --opt filename=Dockerfile \
           --import-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME" \
           --export-cache "type=s3,region=$CACHE_REGION,bucket=$CACHE_BUCKET,endpoint_url=$CACHE_ENDPOINT,use_path_style=true,name=$CACHE_NAME,mode=max,ignore-error=true,touch_refresh=87600h" \
-          --output "type=image,\"name=$REGISTRY/$IMAGE_REPO:$IMAGE_TAG,$REGISTRY/$IMAGE_REPO:latest\",push=true" \
+          --output "type=image,\"name=$REGISTRY/$IMAGE_REPO:$IMAGE_TAG,$REGISTRY/$IMAGE_REPO:latest\",push=true,oci-mediatypes=false" \
           --progress plain
       - echo "pushed $REGISTRY/$IMAGE_REPO:$IMAGE_TAG and :latest"
