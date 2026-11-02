@@ -75,9 +75,11 @@ when:
 steps:
   # Resolve the immutable digest once, and hand it to bunny-push. It used to feed TWO
   # targets (the cluster Deployment and Magic Containers) so the copies could not drift;
-  # since 15-08-2026 there is only one target, but resolving the digest rather than
-  # trusting the tag still matters — the copy to registry.bunny.net is done BY DIGEST,
-  # which is what makes MC's imageDigest comparable to what this pipeline built.
+  # since 15-08-2026 there is only one target, and since 02-11-2026 no copy happens at
+  # all (Magic Containers pulls from registry.ops.ciphera.net directly). Resolving the
+  # digest rather than trusting the tag still matters: it is what makes MC's own
+  # imageDigest comparable to the image this pipeline built, which is the only check
+  # that proves the app is running what was pushed and not a tag someone moved.
   # ⚠️ The Accept list MUST include application/vnd.oci.image.manifest.v1+json.
   # kaniko INHERITS THE BASE IMAGE'S manifest media type, so the same plugin
   # emits a Docker v2 manifest for a `FROM scratch` image and an OCI image
@@ -148,15 +150,13 @@ steps:
     backend_options:
       kubernetes:
         resources:
-          # Larger than the other alpine steps: skopeo streams the whole image through
-          # this pod. BestEffort here means an eviction mid-copy, which presents as a
-          # registry error rather than as what it is.
-          requests: { memory: 512Mi, cpu: 250m }
-          limits: { memory: 1Gi }
-    # Same NLB-hairpin pin as every other step that touches this registry — skopeo
-    # PULLS from registry.ops here, so it is subject to the identical black-holing.
-    extra_hosts:
-      - "registry.ops.ciphera.net:10.101.182.27"
+          # This step no longer streams an image through the pod (the copy into
+          # registry.bunny.net was removed 02-11-2026); it makes a handful of API
+          # calls. Sized down to match, but NOT left unset: BestEffort is first
+          # evicted under node memory pressure, and an eviction here presents as a
+          # Bunny API error rather than as what it is.
+          requests: { memory: 128Mi, cpu: 100m }
+          limits: { memory: 512Mi }
     environment:
       # 🔴 THIS REPO IS PUBLIC. Account and app identifiers come from Woodpecker
       # secrets, not literals. They are not credentials — nothing here is
@@ -168,29 +168,17 @@ steps:
       #   mc_app_id      repo-level (one MC app per repo)
       MC_APP_ID:
         from_secret: mc_app_id
-      BUNNY_ACCOUNT:
-        from_secret: bunny_account
       # Public by definition — it is the hostname users resolve.
       MC_HOSTNAME: icons.ciphera.net
-      BUNNY_REPO: sigil
-      OPS_IMAGE: registry.ops.ciphera.net/ciphera-net/sigil
       # Rebuilt into the PATCH body in the WRITE shape. Sigil's health endpoint is on
       # its own port, not the HTTP port — a frontend's is not the same, so this is per
       # app rather than a shared default.
       PROBE_PATH: /healthz
       PROBE_PORT: "8085"
-      REGISTRY_USERNAME:
-        from_secret: registry_username
-      REGISTRY_PASSWORD:
-        from_secret: registry_password
       BUNNY_API_KEY:
         from_secret: bunny_api_key
     commands:
-      # skopeo is in Alpine's community repo, which is the reason to use it: no NEW
-      # vendor image enters the estate (every prebuilt skopeo/crane image is hosted by
-      # a US company). Installed before anything else so a failure here cannot be
-      # mistaken for a registry problem.
-      - apk add --no-cache skopeo curl jq >/dev/null || { echo "apk add failed"; exit 1; }
+      - apk add --no-cache curl jq >/dev/null || { echo "apk add failed"; exit 1; }
       - |
         DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
         DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
@@ -198,60 +186,19 @@ steps:
         [ -n "$DEPLOY_SHA" ] || { echo "empty deploy_sha handoff"; exit 1; }
         export DIGEST DEPLOY_SHA
         echo "TAG=sha-$DEPLOY_SHA  DIGEST=$DIGEST"
-      # ═══ AUTHFILE ═══
-      # 🔴 registry.bunny.net requires the base64 `auth` FORM. A {username, password}
-      # entry is REJECTED as `unauthorized` — proven 13-08-2026 — and the failure looks
-      # exactly like a wrong credential, so it misdiagnoses as a bad key.
-      # 🔴 Built with jq `env.X`, NOT `--arg`: --arg would put the base64 credential in
-      # this process's argv, readable from /proc by anything sharing the pod. Same
-      # reason skopeo is never given --src-creds/--dest-creds.
-      # Written to /tmp (step-local), never /woodpecker (the shared workflow volume,
-      # which outlives this step and is visible to every other step).
-      - |
-        mkdir -p /tmp/regauth && chmod 700 /tmp/regauth
-        OPSAUTH=$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')
-        BAUTH=$(printf 'token:%s' "$BUNNY_API_KEY" | base64 | tr -d '\n')
-        export OPSAUTH BAUTH
-        jq -n '{auths: {"registry.ops.ciphera.net": {auth: env.OPSAUTH},
-                        "registry.bunny.net":       {auth: env.BAUTH}}}' \
-          > /tmp/regauth/auth.json || { echo "FAIL: building authfile"; exit 1; }
-        chmod 600 /tmp/regauth/auth.json
-        unset OPSAUTH BAUTH
-      # Copy BY DIGEST, tag by commit. Pulling @sha256 rather than :sha-xxx is what
-      # makes the two registries provably hold the same bytes — which is in turn what
-      # lets the verification below compare MC's imageDigest against the digest this
-      # pipeline resolved.
+      # 🔁 THE COPY INTO registry.bunny.net IS GONE (02-11-2026). Magic Containers
+      # pulls this image straight from registry.ops.ciphera.net — MC registry object
+      # 12602, via the GET/HEAD-only host registry-origin.ciphera.net — so copying it
+      # into Bunny's registry fed nothing. What made that possible is
+      # `oci-mediatypes=false` in push.yml: MC's puller sends an Accept header listing
+      # only the Docker manifest types, and registry.bunny.net had been hiding that by
+      # serving OCI to a client that never asked for it. Audit §78.26–§78.27.
       #
-      # ⚠️ THE OUTER RETRY LOOP IS NOT BELT-AND-BRACES — `--retry-times` DOES NOT COVER
-      # THIS. MEASURED 15-08-2026, sigil pipeline 38: the Bunny registry returned
-      #   500 Internal Server Error
-      # on a blob upload (PUT .../blobs/uploads/<uuid>?digest=sha256:...) and skopeo
-      # exited `fatal` immediately, with --retry-times 3 already set. A plain restart of
-      # the same pipeline then succeeded, so the 500 is transient upstream flakiness
-      # rather than anything about this image. Logged in Infra/docs/bunny-beta-feedback.md.
-      #
-      # That matters more than a normal flake because this step is the ONLY path by
-      # which a merge reaches production — a failure here does not fall back to
-      # anything, it just leaves Magic Containers on the previous image.
-      #
-      # Retrying is SAFE to do blindly: the copy is idempotent (same digest, same tag)
-      # and it happens BEFORE any mutation of the MC app, so every failure in this
-      # phase is a no-op against production.
-      - |
-        COPIED=no
-        for attempt in 1 2 3 4 5; do
-          if skopeo copy --authfile /tmp/regauth/auth.json --retry-times 3 \
-               "docker://$OPS_IMAGE@$DIGEST" \
-               "docker://registry.bunny.net/$BUNNY_ACCOUNT/$BUNNY_REPO:sha-$DEPLOY_SHA"; then
-            COPIED=yes; break
-          fi
-          echo "skopeo copy attempt $attempt failed — retrying in $((attempt * 10))s"
-          sleep $((attempt * 10))
-        done
-        # A `for` loop that ends without breaking exits 0, so THIS check is what fails
-        # the step — same shape as the rollout gate above, for the same reason.
-        [ "$COPIED" = "yes" ] \
-          || { echo "FAIL: skopeo copy to registry.bunny.net after 5 attempts"; exit 1; }
+      # 🔴 The PATCH below passes the app's EXISTING imageRegistryId through, so this
+      # pipeline can no longer put the image anywhere else if that id ever changes.
+      # The assertion below is what makes that loud rather than silent: a deploy
+      # against the wrong registry would otherwise set a tag that is not there and
+      # leave production on the old image behind a green pipeline.
       # ═══ RECORD WHAT WE ARE NOT SENDING, BEFORE WE SEND ═══
       # The PATCH replaces the template, so the only way to prove it did not silently
       # drop something is to know what was there first.
@@ -281,6 +228,16 @@ steps:
         echo "invariants before: $(cat /tmp/mc-invariants.json)"
         [ "$(jq '.endpoints | length' /tmp/mc-invariants.json)" -ge 1 ] \
           || { echo "FAIL: MC app already has no endpoints — refusing to touch it"; exit 1; }
+        # 🔴 The image now comes from registry.ops.ciphera.net ONLY — nothing copies it
+        # anywhere else any more. This pipeline passes the app's existing
+        # imageRegistryId through unchanged, so if that id is ever not ours, the PATCH
+        # would point production at a registry this tag was never pushed to: MC keeps
+        # serving the old image and every gate here stays green. Fail loudly instead.
+        # 12602 = "Ciphera registry (pull-only)". ⚠️ The v3 API returns it as a STRING.
+        MCREG=$(jq -r '.containerTemplates[0].imageRegistryId' /tmp/mc-before.json)
+        [ "$MCREG" = "12602" ] \
+          || { echo "FAIL: MC app is on image registry [$MCREG], expected 12602 (ours)."; \
+               echo "Nothing copies images to another registry any more — see the note above."; exit 1; }
       # ═══ 🔴🔴 THE PATCH BODY IS LOAD-BEARING AND A NAIVE ONE IS DESTRUCTIVE ═══
       # PATCH /mc/apps/{id} REPLACES containerTemplates — it does not merge. A body of
       # {name, imageTag} returns 200 and wipes environmentVariables, probes AND
