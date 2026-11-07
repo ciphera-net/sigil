@@ -333,3 +333,69 @@ steps:
       # here: a purge fired now lands before convergence and simply re-caches the old
       # build (measured — see mc-image-sync's manifest for the full reasoning).
       - echo "Magic Containers app $MC_APP_ID set to sha-$DEPLOY_SHA ($MC_HOSTNAME) — rollout across 42 regions takes ~10 min"
+
+  # GREEN MEANS LIVE (since 07-11-2026). bunny-push ends as soon as the app's TEMPLATE holds the new digest, which
+  # the API shows within seconds; the regions then replace their instances over 2.5 to 20 minutes, and a rollout one
+  # region cannot start is put back by Bunny after about 25 minutes with no error anywhere (docs, 21-10-2026). So a
+  # green pipeline meant "configured", not "serving". This step waits until the app reads `active` on the shipped
+  # tag and digest and every ready container in /overview runs that digest, polling every 15 s for at most 20
+  # minutes. A template moved off the shipped tag is a revert and fails at once.
+  wait-live:
+    image: alpine:3.20
+    depends_on: [bunny-push]
+    backend_options:
+      kubernetes:
+        resources:
+          requests: { memory: 128Mi, cpu: 100m }
+          limits: { memory: 512Mi }
+    environment:
+      MC_APP_ID:
+        from_secret: mc_app_id
+      BUNNY_API_KEY:
+        from_secret: bunny_api_key
+    commands:
+      - apk add --no-cache curl jq >/dev/null || { echo "apk add failed"; exit 1; }
+      - |
+        LIMIT=1200
+        DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
+        TAG="sha-$(cat /woodpecker/deploy_sha)" || { echo "deploy_sha handoff missing"; exit 1; }
+        case "$DIGEST" in sha256:*) ;; *) echo "bad digest handoff [$DIGEST]"; exit 1 ;; esac
+        START=$(date +%s); LAST=""
+        while :; do
+          T=$(( $(date +%s) - START ))
+          A=$(curl -s --max-time 20 -o /tmp/mc-app.json -w '%{http_code}' -H "AccessKey: $BUNNY_API_KEY" \
+                "https://api.bunny.net/mc/apps/$MC_APP_ID") || A="curl rc=$?"
+          O=$(curl -s --max-time 30 -o /tmp/mc-overview.json -w '%{http_code}' -H "AccessKey: $BUNNY_API_KEY" \
+                "https://api.bunny.net/mc/apps/$MC_APP_ID/overview") || O="curl rc=$?"
+          if [ "$A" = 200 ] && [ "$O" = 200 ]; then
+            NOWTAG=$(jq -r '.containerTemplates[0].imageTag' /tmp/mc-app.json)
+            if [ "$NOWTAG" != "$TAG" ]; then
+              echo "FAIL: the app's template now names $NOWTAG, not $TAG. Bunny put the previous release back (a region could"
+              echo "not start the new one: read GET /mc/apps/<id>/logs), or a newer deploy replaced this one."
+              exit 1
+            fi
+            ST=$(jq -r --arg d "$DIGEST" '"\(.status) digest-match=\(.containerTemplates[0].imageDigest == $d)"' /tmp/mc-app.json)
+            RD=$(jq -r '[.regions[].pods[].containers[] | select(.status == "ready") | .image | sub(".*@sha256:"; "") | .[0:12]]
+                        | group_by(.) | map("\(.[0]) x\(length)") | join(", ")' /tmp/mc-overview.json)
+            LIVE=$(jq -r --arg d "$DIGEST" '[.regions[].pods[].containers[] | select(.status == "ready") | .image
+                        | endswith("@" + $d)] | (length > 0 and all)' /tmp/mc-overview.json)
+            LINE="$ST | ready containers by digest: $RD"
+            [ "$LINE" != "$LAST" ] && { echo "+$((T))s $LINE"; LAST=$LINE; }
+            if [ "$ST" = "active digest-match=true" ] && [ "$LIVE" = true ]; then
+              echo "LIVE after $((T))s: the app is active on $TAG and every ready container runs $DIGEST"
+              break
+            fi
+          else
+            echo "+$((T))s API read failed (app: $A, overview: $O), retrying"
+          fi
+          if [ "$T" -ge "$LIMIT" ]; then
+            echo "FAIL: not live after $((LIMIT / 60)) minutes. Regions not yet on $DIGEST:"
+            jq -r --arg d "$DIGEST" '.regions[] | select(any(.pods[].containers[]; .status != "ready" or (.image | endswith("@" + $d) | not)))
+                   | "  \(.region): \([.pods[].containers[] | "\(.status) \(.image | sub(".*@sha256:"; "") | .[0:12])"] | join(", "))"' \
+              /tmp/mc-overview.json
+            echo "Bunny reverts a rollout it cannot finish after about 25 minutes. Read GET /mc/apps/<id>/logs for"
+            echo "\"Failed to pull image\" or CreatePodSandboxError lines from those regions."
+            exit 1
+          fi
+          sleep 15
+        done
