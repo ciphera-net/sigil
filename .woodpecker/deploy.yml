@@ -340,6 +340,12 @@ steps:
   # green pipeline meant "configured", not "serving". This step waits until the app reads `active` on the shipped
   # tag and digest and every ready container in /overview runs that digest, polling every 15 s for at most 20
   # minutes. A template moved off the shipped tag is a revert and fails at once.
+  # A region can run the shipped image and still report another digest (08-11-2026): /overview names the manifest
+  # digest the node first pulled that content by. Until 02-11-2026 this repo pushed OCI manifests, and the build is
+  # reproducible, so ten regions that held the OCI form of an unchanged build kept reporting it after the switch to
+  # Docker v2 manifests (same config, same layers). A FAIL whose regions sit on one older digest with no pull error
+  # in the logs is that case: compare the two manifests' config digests before treating it as a fault. A build whose
+  # content changed cannot alias.
   wait-live:
     image: alpine:3.20
     depends_on: [bunny-push]
