@@ -91,7 +91,8 @@ steps:
   # Deployment to that second value would ship something that is not the image
   # that was built, and every gate downstream would still read green.
   digest:
-    image: alpine:3.20
+    image: registry.ops.ciphera.net/ciphera-net/ci-deploy:v1
+    pull: true
     # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
     # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
     # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see
@@ -113,7 +114,6 @@ steps:
       REGISTRY_PASSWORD:
         from_secret: registry_password
     commands:
-      - apk add --no-cache curl jq >/dev/null
       - export DEPLOY_SHA=${CI_COMMIT_SHA:0:7}
       - |
         DIGEST=$(curl -sfI --max-time 60 -u "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
@@ -142,7 +142,8 @@ steps:
   # account API key (their docs say so). Treat `bunny_api_key` accordingly: nothing
   # below may put it in argv, echo it, or write it anywhere that outlives this step.
   bunny-push:
-    image: alpine:3.20
+    image: registry.ops.ciphera.net/ciphera-net/ci-deploy:v1
+    pull: true
     # The `deploy-k8s` dependency this carried until 15-08-2026 is gone with the step
     # itself. It existed to stop `mc-image-sync` racing this one; both are retired, and
     # this step never read the cluster in the first place.
@@ -178,7 +179,6 @@ steps:
       BUNNY_API_KEY:
         from_secret: bunny_api_key
     commands:
-      - apk add --no-cache curl jq >/dev/null || { echo "apk add failed"; exit 1; }
       - |
         DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
         DEPLOY_SHA=$(cat /woodpecker/deploy_sha) || { echo "deploy_sha handoff missing"; exit 1; }
@@ -347,7 +347,8 @@ steps:
   # in the logs is that case: compare the two manifests' config digests before treating it as a fault. A build whose
   # content changed cannot alias.
   wait-live:
-    image: alpine:3.20
+    image: registry.ops.ciphera.net/ciphera-net/ci-deploy:v1
+    pull: true
     depends_on: [bunny-push]
     backend_options:
       kubernetes:
@@ -360,7 +361,6 @@ steps:
       BUNNY_API_KEY:
         from_secret: bunny_api_key
     commands:
-      - apk add --no-cache curl jq >/dev/null || { echo "apk add failed"; exit 1; }
       - |
         LIMIT=1200
         DIGEST=$(cat /woodpecker/digest) || { echo "digest handoff missing"; exit 1; }
