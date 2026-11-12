@@ -11,7 +11,7 @@ when:
 
 steps:
   unit:
-    image: registry.ops.ciphera.net/mirror/docker.io/library/golang:1.26.10@sha256:4ddd76d158c062213aaf055513809cdac05a445b2db3a0f12dbb624ed2e577d9
+    image: registry.ops.ciphera.net/mirror/docker.io/library/golang:1.26-6327cb290853@sha256:6327cb290853a5d13091c436b88259b4f35ff70e49b1f8d9e5d1dd1757e9c6ba
     # Resources declared 29-07-2026 — without them the step pod is QoS BestEffort, first
     # evicted under node memory pressure. Estate-wide sweep after two pulse-backend steps
     # were SIGKILLed (exit 137) mid-download, presenting as a test failure (see
